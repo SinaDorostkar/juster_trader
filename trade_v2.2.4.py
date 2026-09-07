@@ -539,4 +539,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    print("=== BOT STARTING ===", flush=True)
+
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("=== FATAL ERROR ===", flush=True)
+        traceback.print_exc()
+        raise
