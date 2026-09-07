@@ -1,1 +1,82 @@
+name: Crypto Bot V4
 
+on:
+  schedule:
+    # Run V4 once per hour, a few minutes after the hour to reduce API-boundary issues.
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+# V4 writes trained .pth checkpoints back to the repository.
+permissions:
+  contents: write
+
+# Never allow two runs to train/write the same checkpoints simultaneously.
+concurrency:
+  group: crypto-bot-v4
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  v4:
+    name: Run V4 bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy torch turso_serverless
+
+      - name: Verify V4 files
+        run: |
+          test -f trade_v4.py
+          test -f V4_README.md || true
+          python -m py_compile trade_v4.py
+          mkdir -p models
+
+      - name: Run V4
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          YOUR_CHAT_ID: ${{ secrets.YOUR_CHAT_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: python trade_v4.py
+
+      - name: Show checkpoint changes
+        if: always()
+        run: |
+          git status --short
+          git diff -- models/*.pth || true
+
+      - name: Commit trained V4 checkpoints
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Only commit model checkpoints produced/updated by V4.
+          git add models/*.pth
+
+          if git diff --cached --quiet; then
+            echo "No new V4 checkpoint to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update V4 model checkpoints"
+          git push
