@@ -1,0 +1,6 @@
+requests
+pandas
+numpy
+torch
+turso-serverless
+matplotlib
