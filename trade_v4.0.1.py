@@ -505,7 +505,12 @@ def get_depth(symbol, limit=100):
     result = data.get("result", {})
 
     for value in result.values():
-        return {"bids": value.get("bids", []), "asks": value.get("asks", [])}
+        # Kraken returns [price, volume, timestamp] per level — trim to
+        # [price, volume] to match the 2-tuple shape orderbook_features()
+        # expects (Binance's depth format only ever had two elements).
+        bids = [level[:2] for level in value.get("bids", [])]
+        asks = [level[:2] for level in value.get("asks", [])]
+        return {"bids": bids, "asks": asks}
 
     return {"bids": [], "asks": []}
 
