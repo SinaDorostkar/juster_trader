@@ -41,8 +41,8 @@ jobs:
 
       - name: Verify V4.0.1 files
         run: |
-          test -f trade_v4.py
-          python -m py_compile trade_v4.py
+          test -f trade_v4.0.1.py
+          python -m py_compile trade_v4.0.1.py
           mkdir -p models
 
       - name: Run V4.0.1
@@ -52,7 +52,7 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-        run: python trade_v4.py
+        run: python trade_v4.0.1.py
 
       - name: Show checkpoint changes
         if: always()
