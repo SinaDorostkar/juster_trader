@@ -55,7 +55,10 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 
-BINANCE_FAPI = "https://fapi.binance.com"
+KRAKEN_SPOT_BASE = "https://api.kraken.com"
+KRAKEN_FUTURES_BASE = "https://futures.kraken.com/derivatives/api/v3"
+
+KRAKEN_INTERVAL_MINUTES = {"1h": 60, "4h": 240, "1d": 1440}
 
 STATIC_WATCHLIST = [
     "BTCUSDT", "ETHUSDT", "DOGEUSDT", "SHIBUSDT",
@@ -287,57 +290,101 @@ def api_get(base, path, params=None):
 
 
 def get_exchange_info():
-    return api_get(BINANCE_FAPI, "/fapi/v1/exchangeInfo")
+    return api_get(KRAKEN_SPOT_BASE, "/0/public/AssetPairs")
 
 
-def valid_futures_symbols():
+_kraken_pairs_cache = None
+
+
+def valid_kraken_symbols():
+    """Every symbol elsewhere in this file (DB rows, Telegram messages,
+    the STATIC_WATCHLIST) stays in familiar 'BTCUSDT'-style canonical
+    form. This function is the ONLY place that talks to Kraken's own
+    (fairly messy, legacy-encumbered) pair-naming — everything else just
+    calls kraken_pair_name(symbol) to translate at the HTTP boundary.
+    We derive the canonical name from Kraken's own 'wsname' field
+    (documented, human-readable 'BASE/QUOTE' form) rather than trying to
+    manually strip Kraken's legacy X/Z asset-code prefixes ourselves,
+    since wsname exists specifically to sidestep that mess."""
     data = get_exchange_info()
+    pairs = data.get("result", {})
 
     result = {}
 
-    for item in data.get("symbols", []):
-        symbol = item.get("symbol", "")
+    for info in pairs.values():
+        wsname = info.get("wsname", "")
 
-        if item.get("status") != "TRADING":
+        if "/" not in wsname:
             continue
 
-        if item.get("quoteAsset") != "USDT":
+        base, quote = wsname.split("/")
+
+        if quote not in ("USD", "USDT"):
             continue
 
-        contract_type = item.get("contractType", "")
-        if contract_type != "PERPETUAL":
+        base = "BTC" if base == "XBT" else base
+        canonical = f"{base}USDT"
+
+        # Prefer a native USDT-quoted pair over a USD one if both exist
+        # for the same coin, since the rest of this file assumes "USDT".
+        if canonical in result and quote != "USDT":
             continue
 
-        base = item.get("baseAsset", "").upper()
-
-        # Futures universe: USDT-margined perpetual contracts only.
-        if any(x in base for x in ("UP", "DOWN", "BULL", "BEAR")):
-            continue
-
-        result[symbol] = item
+        result[canonical] = {
+            "kraken_pair": info.get("altname", ""),
+            "lot_decimals": info.get("lot_decimals", 8),
+            "ordermin": float(info.get("ordermin", 0.0) or 0.0),
+            "costmin": float(info.get("costmin", 0.0) or 0.0),
+        }
 
     return result
 
 
+def kraken_pairs():
+    global _kraken_pairs_cache
+
+    if _kraken_pairs_cache is None:
+        _kraken_pairs_cache = valid_kraken_symbols()
+
+    return _kraken_pairs_cache
+
+
+def kraken_pair_name(symbol):
+    info = kraken_pairs().get(symbol)
+
+    if not info:
+        raise RuntimeError(f"Unknown or unsupported symbol on Kraken: {symbol}")
+
+    return info["kraken_pair"]
+
+
 def get_top_symbols():
-    valid = valid_futures_symbols()
-    tickers = api_get(BINANCE_FAPI, "/fapi/v1/ticker/24hr")
+    valid = kraken_pairs()
+
+    try:
+        tickers = api_get(KRAKEN_SPOT_BASE, "/0/public/Ticker")
+        ticker_result = tickers.get("result", {})
+    except Exception as exc:
+        log.warning("Could not fetch Kraken tickers: %s", exc)
+        ticker_result = {}
 
     candidates = []
 
-    for ticker in tickers:
-        symbol = ticker.get("symbol", "")
+    for canonical, info in valid.items():
+        ticker = ticker_result.get(info["kraken_pair"])
 
-        if symbol not in valid:
+        if not ticker:
             continue
 
         try:
-            volume = float(ticker.get("quoteVolume", 0))
+            last_price = float(ticker["c"][0])
+            base_volume_24h = float(ticker["v"][1])
+            usd_volume = last_price * base_volume_24h
         except Exception:
             continue
 
-        if volume >= MIN_24H_VOLUME_USD:
-            candidates.append((symbol, volume))
+        if usd_volume >= MIN_24H_VOLUME_USD:
+            candidates.append((canonical, usd_volume))
 
     candidates.sort(key=lambda x: x[1], reverse=True)
 
@@ -359,19 +406,28 @@ def get_top_symbols():
 
 
 def get_klines(symbol, interval, limit=500, start_ms=None, end_ms=None):
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": min(int(limit), 1000)
-    }
+    pair = kraken_pair_name(symbol)
+    minutes = KRAKEN_INTERVAL_MINUTES.get(interval)
+
+    if minutes is None:
+        raise ValueError(f"Unsupported interval for Kraken: {interval}")
+
+    params = {"pair": pair, "interval": minutes}
 
     if start_ms is not None:
-        params["startTime"] = int(start_ms)
+        params["since"] = int(start_ms // 1000)
 
-    if end_ms is not None:
-        params["endTime"] = int(end_ms)
+    raw = api_get(KRAKEN_SPOT_BASE, "/0/public/OHLC", params)
+    result = raw.get("result", {})
 
-    raw = api_get(BINANCE_FAPI, "/fapi/v1/klines", params)
+    # Kraken echoes back its OWN internal pair key in the response, which
+    # doesn't always match the altname we queried with — so we take
+    # whichever series is present rather than re-indexing by name.
+    series = None
+    for key, value in result.items():
+        if key != "last":
+            series = value
+            break
 
     columns = [
         "open_ms", "open", "high", "low", "close", "volume",
@@ -379,7 +435,28 @@ def get_klines(symbol, interval, limit=500, start_ms=None, end_ms=None):
         "taker_base", "taker_quote", "ignore"
     ]
 
-    df = pd.DataFrame(raw, columns=columns)
+    if not series:
+        return pd.DataFrame(columns=columns)
+
+    interval_ms = minutes * 60 * 1000
+    rows = []
+
+    for candle in series:
+        # Kraken candle: [time, open, high, low, close, vwap, volume, count]
+        open_ms = int(float(candle[0]) * 1000)
+
+        rows.append([
+            open_ms,
+            candle[1], candle[2], candle[3], candle[4],
+            candle[6],
+            open_ms + interval_ms - 1,   # Kraken gives only open time
+            float(candle[6]) * float(candle[5]),  # approx quote volume (vol * vwap)
+            candle[7],                    # trade count
+            0.0, 0.0,                     # taker base/quote — not exposed by Kraken
+            None
+        ])
+
+    df = pd.DataFrame(rows, columns=columns)
 
     if df.empty:
         return df
@@ -399,36 +476,85 @@ def get_klines(symbol, interval, limit=500, start_ms=None, end_ms=None):
     now_ms = int(time.time() * 1000)
     df = df[df["close_ms"] < now_ms].copy()
 
+    if end_ms is not None:
+        df = df[df["open_ms"] <= end_ms].copy()
+
+    # Kraken's OHLC endpoint doesn't take a limit param — it just returns
+    # everything since `since` (up to its own internal cap), so we
+    # truncate client-side to preserve the old call-site contract.
+    if limit:
+        df = df.tail(int(limit)).copy()
+
     return df.reset_index(drop=True)
 
 
 def get_price(symbol):
-    data = api_get(
-        BINANCE_FAPI,
-        "/fapi/v1/ticker/price",
-        {"symbol": symbol}
-    )
+    pair = kraken_pair_name(symbol)
+    data = api_get(KRAKEN_SPOT_BASE, "/0/public/Ticker", {"pair": pair})
+    result = data.get("result", {})
 
-    return float(data["price"])
+    for value in result.values():
+        return float(value["c"][0])
+
+    raise RuntimeError(f"No ticker data returned for {symbol}")
 
 
 def get_depth(symbol, limit=100):
-    return api_get(
-        BINANCE_FAPI,
-        "/fapi/v1/depth",
-        {"symbol": symbol, "limit": limit}
-    )
+    pair = kraken_pair_name(symbol)
+    data = api_get(KRAKEN_SPOT_BASE, "/0/public/Depth", {"pair": pair, "count": limit})
+    result = data.get("result", {})
+
+    for value in result.values():
+        return {"bids": value.get("bids", []), "asks": value.get("asks", [])}
+
+    return {"bids": [], "asks": []}
+
+
+_kraken_futures_tickers_cache = None
+
+
+def _kraken_futures_tickers():
+    """Fetched once per run and reused across every symbol — the same
+    fix applied earlier to btc_regime() being recomputed per symbol."""
+    global _kraken_futures_tickers_cache
+
+    if _kraken_futures_tickers_cache is None:
+        try:
+            data = api_get(KRAKEN_FUTURES_BASE, "/tickers")
+            _kraken_futures_tickers_cache = data.get("tickers", [])
+        except Exception as exc:
+            log.warning("Could not fetch Kraken Futures tickers: %s", exc)
+            _kraken_futures_tickers_cache = []
+
+    return _kraken_futures_tickers_cache
+
+
+def _find_futures_ticker(symbol):
+    base = symbol[:-4]
+    base = "XBT" if base == "BTC" else base
+
+    # Kraken Futures perpetual symbols use a prefix (commonly PF_ or
+    # PI_ depending on contract generation) that we can't fully confirm
+    # without a live test — matching on the base asset suffix rather
+    # than assuming one exact prefix is deliberately more forgiving of
+    # that uncertainty.
+    for ticker in _kraken_futures_tickers():
+        tsym = ticker.get("symbol", "")
+
+        if tsym.startswith(("PF_", "PI_")) and tsym.endswith(f"{base}USD"):
+            return ticker
+
+    return None
 
 
 def get_funding(symbol):
     try:
-        data = api_get(
-            BINANCE_FAPI,
-            "/fapi/v1/premiumIndex",
-            {"symbol": symbol}
-        )
+        ticker = _find_futures_ticker(symbol)
 
-        return float(data.get("lastFundingRate", 0) or 0)
+        if not ticker:
+            return 0.0
+
+        return float(ticker.get("fundingRate", 0) or 0)
 
     except Exception:
         return 0.0
@@ -436,13 +562,12 @@ def get_funding(symbol):
 
 def get_open_interest(symbol):
     try:
-        data = api_get(
-            BINANCE_FAPI,
-            "/fapi/v1/openInterest",
-            {"symbol": symbol}
-        )
+        ticker = _find_futures_ticker(symbol)
 
-        return float(data.get("openInterest", 0) or 0)
+        if not ticker:
+            return 0.0
+
+        return float(ticker.get("openInterest", 0) or 0)
 
     except Exception:
         return 0.0
@@ -1924,45 +2049,15 @@ def get_symbol_filters(
     exchange_info,
     symbol
 ):
-    filters = {
-        item["filterType"]: item
-        for item in exchange_info[symbol].get(
-            "filters",
-            []
-        )
-    }
+    info = exchange_info.get(symbol, {})
 
-    lot = filters.get(
-        "LOT_SIZE",
-        {}
-    )
-
-    minimum_notional = filters.get(
-        "MIN_NOTIONAL",
-        filters.get("NOTIONAL", {})
-    )
+    lot_decimals = int(info.get("lot_decimals", 8))
+    step = 10 ** (-lot_decimals)
 
     return (
-        float(
-            lot.get(
-                "stepSize",
-                1.0
-            )
-        ),
-
-        float(
-            lot.get(
-                "minQty",
-                0.0
-            )
-        ),
-
-        float(
-            minimum_notional.get(
-                "minNotional",
-                0.0
-            )
-        )
+        float(step),
+        float(info.get("ordermin", 0.0) or 0.0),
+        float(info.get("costmin", 0.0) or 0.0)
     )
 
 
