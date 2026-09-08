@@ -1,51 +1,33 @@
-# Crypto Bot V4.0
+# Crypto Bot V4.0.1
 
-V4.0 is the new production candidate. V2.2.4 and V3.1.4 should remain in the repository as testing/baseline implementations but are not run by the production workflow.
+Clean causal V4 data/training revision.
 
-## Architecture
+## What is fixed
+- Uses **USDT-margined Binance perpetual futures consistently** for universe, candles, price, depth, funding and open interest. No spot/futures price/order-book mismatch.
+- All multi-timeframe sequences are explicitly cut off at the same primary closed-candle decision time.
+- Historical microstructure is queried `<= decision time`; no latest-snapshot leakage.
+- Historical BTC regime is computed as-of each sample time.
+- Clean V4.0.1 tables are isolated from older V4 observations/models.
+- Observations are inserted even when no model checkpoint exists, removing bootstrap deadlock.
+- Model-independent decision entry/TP/SL are stored for causal labels.
+- Live price is fetched only after model + EV + exposure filters pass; live target/stop/quantity are calculated from that live price.
+- Turso threshold/temperature are authoritative when present, with checkpoint fallback.
+- Critical Turso commit failures are raised instead of silently ignored.
+- Future labels begin strictly after the decision candle close.
+- Same-candle TP+SL resolves conservatively as a stop.
 
-- 1H price sequence: TCN + BiLSTM + attention
-- 4H price sequence: TCN + BiLSTM + attention
-- 1D price sequence: TCN + BiLSTM + attention
-- Historical order-book sequence: TCN + BiLSTM + attention
-- BTC market-regime context
-- Funding and open-interest context
-- Calibrated probability
-- Time-to-event prediction
-- Expected-value filter
-- Risk/exposure limits
-- Future-candle TP/SL labeling
-- Chronological train/validation/test split
-- Purged split boundaries
-- Sparse training observations to reduce overlapping samples
+## Deployment status
+This revision is suitable for GitHub Actions deployment as a **data-collection / paper-signal bot**. It does not place exchange orders.
 
-## Files
+Do not interpret successful deployment as proof of trading profitability. A live-money decision should wait until V4.0.1 has accumulated enough clean resolved observations, passed chronological validation/test checks, and produced stable calibration/EV results.
 
-trade_v4.py
-models/brain_v4_day.pth
-models/brain_v4_swing.pth
-.github/workflows/crypto-v4.yml
+## Required GitHub Secrets
+- `TELEGRAM_TOKEN`
+- `YOUR_CHAT_ID`
+- `CHANNEL_ID` (optional)
+- `TURSO_DATABASE_URL`
+- `TURSO_AUTH_TOKEN`
+- `ACCOUNT_EQUITY` (optional)
+- `RISK_PER_TRADE` (optional)
 
-## Important
-
-The first phase intentionally does NOT start with a pretrained V2/V3 brain.
-
-V4 needs to collect its own clean observations and historical order-book snapshots.
-
-A model checkpoint will not exist immediately. Once enough resolved V4 observations accumulate, GitHub Actions trains the model and commits the resulting .pth file back to the repository.
-
-The bot is long-only and does not place exchange orders.
-
-## GitHub Actions
-
-The workflow requires:
-
-- TELEGRAM_TOKEN
-- YOUR_CHAT_ID
-- CHANNEL_ID (optional)
-- TURSO_DATABASE_URL
-- TURSO_AUTH_TOKEN
-
-The workflow has contents: write permission because it commits updated model checkpoints.
-
-No VPS or persistent server is required.
+The workflow installs Python dependencies and commits `models/*.pth` after successful training.
