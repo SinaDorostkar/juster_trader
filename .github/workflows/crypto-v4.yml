@@ -31,11 +31,11 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas numpy torch turso_serverless
+          python -m pip install -r requirements.txt
 
       - name: Verify V4.0.1 files
         run: |
