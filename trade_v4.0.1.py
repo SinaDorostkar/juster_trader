@@ -5,6 +5,7 @@ import math
 import random
 import logging
 from pathlib import Path
+from datetime import datetime, timezone
 
 import requests
 import pandas as pd
@@ -101,7 +102,7 @@ PRICE_FEATURES = [
 
 MICRO_FEATURES = [
     "obi5", "obi10", "obi20", "obi50", "obi100",
-    "spread", "funding", "oi_change", "price_ret", "valid"
+    "spread", "book_age", "funding", "oi_change", "price_ret", "valid"
 ]
 
 STATIC_FEATURES = [
@@ -232,7 +233,7 @@ def init_db():
         snapshot_ms INTEGER NOT NULL,
         price REAL NOT NULL,
         obi5 REAL, obi10 REAL, obi20 REAL, obi50 REAL, obi100 REAL,
-        spread_bps REAL, funding REAL,
+        spread_bps REAL, book_age_sec REAL, funding REAL,
         open_interest REAL, oi_change REAL,
         btc_ret24 REAL, btc_vol24 REAL, btc_ema_spread REAL,
         UNIQUE(symbol, snapshot_ms)
@@ -252,6 +253,13 @@ def init_db():
     )
     """)
 
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS system_state_v401 (
+        key TEXT PRIMARY KEY,
+        value INTEGER
+    )
+    """)
+
     db_execute("""CREATE INDEX IF NOT EXISTS idx_v401_predictions_resolution
     ON predictions_v401(resolved, strategy)""")
     db_execute("""CREATE INDEX IF NOT EXISTS idx_v401_predictions_source
@@ -261,7 +269,7 @@ def init_db():
 
 
 # ============================================================
-# BINANCE HTTP
+# KRAKEN HTTP
 # ============================================================
 
 def api_get(base, path, params=None):
@@ -286,7 +294,7 @@ def api_get(base, path, params=None):
             last_error = exc
             time.sleep(1.5 * (2 ** attempt))
 
-    raise RuntimeError(f"Binance API failed: {path}: {last_error}")
+    raise RuntimeError(f"Kraken API failed: {path}: {last_error}")
 
 
 def get_exchange_info():
@@ -505,12 +513,11 @@ def get_depth(symbol, limit=100):
     result = data.get("result", {})
 
     for value in result.values():
-        # Kraken returns [price, volume, timestamp] per level — trim to
-        # [price, volume] to match the 2-tuple shape orderbook_features()
-        # expects (Binance's depth format only ever had two elements).
-        bids = [level[:2] for level in value.get("bids", [])]
-        asks = [level[:2] for level in value.get("asks", [])]
-        return {"bids": bids, "asks": asks}
+        # Kraken returns [price, volume, timestamp] per level. We keep
+        # all three now — the timestamp becomes a genuine feature
+        # (book_age_sec, see orderbook_features) instead of being
+        # discarded.
+        return {"bids": value.get("bids", []), "asks": value.get("asks", [])}
 
     return {"bids": [], "asks": []}
 
@@ -587,12 +594,12 @@ def orderbook_features(depth):
     for level in (5, 10, 20, 50, 100):
         bid_notional = sum(
             float(price) * float(quantity)
-            for price, quantity in bids[:level]
+            for price, quantity, *_rest in bids[:level]
         )
 
         ask_notional = sum(
             float(price) * float(quantity)
-            for price, quantity in asks[:level]
+            for price, quantity, *_rest in asks[:level]
         )
 
         denominator = bid_notional + ask_notional
@@ -612,10 +619,26 @@ def orderbook_features(depth):
             ((best_ask - best_bid) / midpoint) * 10000
             if midpoint else 0.0
         )
+
+        # Kraken includes a per-level "last updated" timestamp we were
+        # previously discarding entirely. The age of the top-of-book
+        # quote is genuine signal: a small value means the market is
+        # actively quoting right now (liquid, attentive), a large one
+        # means the book has gone stale (thin, quiet). We only have this
+        # timestamp on Kraken's depth response — Binance's didn't expose
+        # it, which is presumably why it was dropped in the first place.
+        if len(bids[0]) >= 3 and len(asks[0]) >= 3:
+            now_sec = time.time()
+            best_bid_ts = float(bids[0][2])
+            best_ask_ts = float(asks[0][2])
+            book_age_sec = max(0.0, now_sec - ((best_bid_ts + best_ask_ts) / 2))
+        else:
+            book_age_sec = 0.0
     else:
         spread_bps = 0.0
+        book_age_sec = 0.0
 
-    return values, spread_bps
+    return values, spread_bps, book_age_sec
 
 
 # ============================================================
@@ -824,7 +847,7 @@ def collect_snapshot(symbol, btc_context):
         price = get_price(symbol)
 
         depth = get_depth(symbol, 100)
-        obi, spread_bps = orderbook_features(depth)
+        obi, spread_bps, book_age_sec = orderbook_features(depth)
 
         funding = get_funding(symbol)
         open_interest = get_open_interest(symbol)
@@ -851,11 +874,11 @@ def collect_snapshot(symbol, btc_context):
         INSERT OR IGNORE INTO market_snapshots_v401 (
             symbol, snapshot_ms, price,
             obi5, obi10, obi20, obi50, obi100,
-            spread_bps, funding,
+            spread_bps, book_age_sec, funding,
             open_interest, oi_change,
             btc_ret24, btc_vol24, btc_ema_spread
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             symbol,
             bucket_ms,
@@ -868,6 +891,7 @@ def collect_snapshot(symbol, btc_context):
             obi[100],
 
             spread_bps,
+            book_age_sec,
             funding,
 
             open_interest,
@@ -885,7 +909,7 @@ def collect_snapshot(symbol, btc_context):
 def build_micro_sequence(symbol, length, as_of_ms):
     rows = db_query("""
         SELECT snapshot_ms, obi5, obi10, obi20, obi50, obi100,
-               spread_bps, funding, oi_change, price
+               spread_bps, book_age_sec, funding, oi_change, price
         FROM market_snapshots_v401
         WHERE symbol=? AND snapshot_ms <= ?
         ORDER BY snapshot_ms DESC LIMIT ?
@@ -895,15 +919,19 @@ def build_micro_sequence(symbol, length, as_of_ms):
         return None, None
     values = []
     for index, row in enumerate(rows):
-        snapshot_ms, obi5, obi10, obi20, obi50, obi100, spread_bps, funding, oi_change, price = row
+        snapshot_ms, obi5, obi10, obi20, obi50, obi100, spread_bps, book_age_sec, funding, oi_change, price = row
         if index == 0:
             price_return = 0.0
         else:
-            previous_price = float(rows[index - 1][9]); current_price = float(price)
+            previous_price = float(rows[index - 1][10]); current_price = float(price)
             price_return = math.log(current_price / previous_price) if previous_price > 0 and current_price > 0 else 0.0
-        values.append([float(obi5 or 0), float(obi10 or 0), float(obi20 or 0), float(obi50 or 0), float(obi100 or 0), float(spread_bps or 0) / 100.0, float(funding or 0) * 1000.0, float(oi_change or 0) * 10.0, price_return, 1.0])
+        # book_age_sec is raw seconds since the top-of-book quote last
+        # moved — scale into units of 5 minutes and cap so one very stale
+        # reading (e.g. a thinly-traded symbol overnight) doesn't dominate.
+        book_age_scaled = min((float(book_age_sec or 0) / 300.0), 5.0)
+        values.append([float(obi5 or 0), float(obi10 or 0), float(obi20 or 0), float(obi50 or 0), float(obi100 or 0), float(spread_bps or 0) / 100.0, book_age_scaled, float(funding or 0) * 1000.0, float(oi_change or 0) * 10.0, price_return, 1.0])
     array = np.asarray(values, dtype=np.float32)
-    array[:, :9] = np.clip(array[:, :9], -10, 10)
+    array[:, :10] = np.clip(array[:, :10], -10, 10)
     return array, int(rows[-1][0])
 
 def micro_static_as_of(symbol, as_of_ms):
@@ -1971,6 +1999,10 @@ def train_strategy(strategy):
         test_ev
     )
 
+    telegram_send(
+        format_model_retrained(strategy, threshold, temperature, metrics)
+    )
+
     return True
 
 
@@ -2225,7 +2257,11 @@ def unresolved_predictions():
             source_close_ms,
             decision_entry_price,
             target_price,
-            stop_price
+            stop_price,
+            signaled,
+            live_entry_price,
+            live_target_price,
+            live_stop_price
         FROM predictions_v401
         WHERE resolved=0
         ORDER BY symbol, id
@@ -2251,8 +2287,9 @@ def resolve_symbol(symbol,predictions):
         log.warning("Could not resolve %s: %s",symbol,exc); return
     if future.empty: return
     now_ms=int(time.time()*1000)
+    resolved_count=0
     for row in predictions:
-        prediction_id,_,strategy,predicted_at,source_close,entry,target,stop=row
+        prediction_id,_,strategy,predicted_at,source_close,entry,target,stop,signaled,live_entry,live_target,live_stop=row
         source_close=int(source_close); horizon_ms=int(STRATEGIES[strategy]["timeout_h"]*3600*1000)
         deadline=min(now_ms,source_close+horizon_ms)
         bars=future[(future["open_ms"]>source_close)&(future["open_ms"]<=deadline)]
@@ -2268,6 +2305,13 @@ def resolve_symbol(symbol,predictions):
             outcome=0; outcome_type="timeout"; resolved_at=source_close+horizon_ms; hours=STRATEGIES[strategy]["timeout_h"]
         if outcome is not None:
             db_execute("UPDATE predictions_v401 SET resolved=1,outcome=?,outcome_type=?,resolved_at=?,hours_to_result=? WHERE id=?",(outcome,outcome_type,resolved_at,hours,prediction_id))
+            resolved_count+=1
+            # Only alert on trades the user was actually told about —
+            # shadow-logged (non-signaled) observations resolve silently,
+            # same principle as never alerting on them in the first place.
+            if signaled:
+                telegram_send(format_trade_resolved(symbol,strategy,outcome_type,live_entry,live_target,live_stop,hours))
+    return resolved_count
 
 
 # ============================================================
@@ -2322,9 +2366,42 @@ def telegram_send(message):
     return success
 
 
+def format_run_started():
+    return (
+        f"🟢 V4.0.1 run started\n"
+        f"Device: {DEVICE} | Time: {datetime.now(timezone.utc).isoformat()}"
+    )
+
+
+def format_run_completed(stats):
+    return (
+        f"🟢 V4.0.1 run completed\n"
+        f"Duration: {stats['duration_sec']:.0f}s\n"
+        f"Universe: {stats['universe']} symbols\n"
+        f"Signals sent: {stats['signals']}\n"
+        f"Trades resolved: {stats['resolved']}\n"
+        f"Errors: {stats['errors']}"
+    )
+
+
+def format_data_collection(ok_count, fail_count, failed_symbols, universe_size):
+    message = (
+        f"📊 Data collection\n"
+        f"Universe: {universe_size} symbols\n"
+        f"Snapshots: {ok_count} ok, {fail_count} failed"
+    )
+
+    if failed_symbols:
+        shown = ", ".join(failed_symbols[:15])
+        extra = f" (+{len(failed_symbols) - 15} more)" if len(failed_symbols) > 15 else ""
+        message += f"\nFailed: {shown}{extra}"
+
+    return message
+
+
 def format_signal(signal):
     return (
-        f"🧠 V4.0 {signal['strategy'].upper()} SIGNAL\n"
+        f"🔔 V4.0 {signal['strategy'].upper()} SIGNAL\n"
         f"Coin: {signal['symbol']}\n"
         f"Live entry: {signal['entry']:.8g}\n"
         f"Target: {signal['target']:.8g}\n"
@@ -2336,6 +2413,123 @@ def format_signal(signal):
         f"Model: {VERSION}\n"
         f"Decision close: {signal['decision_entry']:.8g} | no exchange order is placed."
     )
+
+
+def format_trade_resolved(symbol, strategy, outcome_type, live_entry, live_target, live_stop, hours):
+    won = outcome_type == "target"
+    icon = "✅" if won else "❌"
+
+    label = {
+        "target": "TARGET HIT",
+        "stop": "STOPPED OUT",
+        "both_same_candle_conservative_stop": "STOPPED OUT (target+stop same candle)",
+        "timeout": "TIMED OUT"
+    }.get(outcome_type, outcome_type.upper())
+
+    entry = live_entry if live_entry is not None else None
+    exit_price = live_target if won else live_stop
+
+    pct = None
+    if entry and exit_price:
+        pct = ((exit_price - entry) / entry) * 100 if won else ((exit_price - entry) / entry) * 100
+
+    message = (
+        f"{icon} Trade resolved — {label}\n"
+        f"Coin: {symbol} [{strategy}]\n"
+    )
+
+    if entry is not None and exit_price is not None:
+        message += f"Entry: {entry:.8g} → Exit: {exit_price:.8g}"
+        if pct is not None:
+            message += f" ({pct:+.2f}%)"
+        message += "\n"
+
+    message += f"Held: {hours:.1f}h"
+
+    return message
+
+
+def format_model_retrained(strategy, threshold, temperature, metrics):
+    return (
+        f"🧠 Model retrained — {strategy}\n"
+        f"Samples: {metrics['train_rows']} train / {metrics['validation_rows']} val / {metrics['test_rows']} test\n"
+        f"Test logloss: {metrics['test_logloss']:.4f} | Brier: {metrics['test_brier']:.4f}\n"
+        f"Test precision @ threshold: {metrics['test_precision']:.1%} ({metrics['test_signals']} signals)\n"
+        f"Test EV: {metrics['test_ev']:+.3f}\n"
+        f"Threshold: {threshold:.1%} | Temperature: {temperature:.3f}\n"
+        f"Model: {VERSION}"
+    )
+
+
+def format_error(context, exc):
+    return (
+        f"⚠️ Error — {context}\n"
+        f"{type(exc).__name__}: {str(exc)[:300]}"
+    )
+
+
+def get_system_marker(key):
+    rows = db_query("SELECT value FROM system_state_v401 WHERE key=?", (key,))
+    return int(rows[0][0]) if rows and rows[0][0] is not None else 0
+
+
+def set_system_marker(key, value):
+    db_execute("""
+    INSERT INTO system_state_v401 (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (key, int(value)))
+
+
+def format_health_summary():
+    lines = ["📈 Periodic health summary"]
+
+    for strategy in STRATEGIES:
+        state = db_query("""
+            SELECT trained_samples, threshold, temperature,
+                   test_precision, test_ev, last_train_ms
+            FROM model_state_v401 WHERE strategy=?
+        """, (strategy,))
+
+        open_rows = db_query("""
+            SELECT COUNT(*) FROM predictions_v401
+            WHERE strategy=? AND signaled=1 AND resolved=0
+        """, (strategy,))
+        open_count = int(open_rows[0][0]) if open_rows else 0
+
+        window_ms = int(time.time() * 1000) - 30 * 24 * 3600 * 1000
+        recent = db_query("""
+            SELECT outcome FROM predictions_v401
+            WHERE strategy=? AND signaled=1 AND resolved=1 AND resolved_at >= ?
+        """, (strategy, window_ms))
+
+        win_rate = (
+            sum(1 for r in recent if r[0] == 1) / len(recent)
+            if recent else None
+        )
+
+        lines.append(f"\n[{strategy}]")
+        lines.append(f"Open signaled trades: {open_count}")
+        lines.append(
+            f"30d win rate: {win_rate:.1%} ({len(recent)} resolved)"
+            if win_rate is not None
+            else "30d win rate: no resolved trades yet"
+        )
+
+        if state:
+            samples, threshold, temperature, precision, ev, last_train_ms = state[0]
+            trained_ago_h = (
+                (int(time.time() * 1000) - last_train_ms) / 3600000
+                if last_train_ms else None
+            )
+            lines.append(
+                f"Model: {samples or 0} samples | threshold {threshold or 0:.1%} | "
+                f"last trained {trained_ago_h:.0f}h ago" if trained_ago_h is not None
+                else f"Model: {samples or 0} samples | threshold {threshold or 0:.1%} | never trained"
+            )
+        else:
+            lines.append("Model: not trained yet")
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -2411,18 +2605,29 @@ def maybe_train():
 # ============================================================
 
 def main():
+    start_time = time.time()
     init_db()
 
     log.info(
-        "Starting V4.0 | device=%s",
+        "Starting V4.0.1 | device=%s",
         DEVICE
     )
 
-    symbols, exchange_info = (
-        get_top_symbols()
-    )
+    telegram_send(format_run_started())
 
-    btc_context = btc_regime()
+    errors = []
+
+    # Wrapping this specifically because it's exactly what crashed last
+    # time (the Binance/Kraken 451 failure) — before, that crash happened
+    # before any Telegram code ever ran, so there was no notification at
+    # all. Now a failure here is reported before the process exits.
+    try:
+        symbols, exchange_info = get_top_symbols()
+        btc_context = btc_regime()
+    except Exception as exc:
+        log.exception("Fatal setup failure: %s", exc)
+        telegram_send(format_error("startup (get_top_symbols / btc_regime)", exc))
+        raise
 
     log.info(
         "Universe: %d symbols",
@@ -2431,30 +2636,58 @@ def main():
 
     # Collect one historical microstructure observation per symbol
     # per hourly bucket.
+    snapshot_ok = 0
+    snapshot_failed = []
+
     for symbol in symbols:
         try:
             collect_snapshot(
                 symbol,
                 btc_context
             )
+            snapshot_ok += 1
         except Exception as exc:
             log.warning(
                 "Snapshot loop failed for %s: %s",
                 symbol,
                 exc
             )
+            snapshot_failed.append(symbol)
+
+    telegram_send(
+        format_data_collection(snapshot_ok, len(snapshot_failed), snapshot_failed, len(symbols))
+    )
+
+    # A large fraction of failures suggests something systemic (an API
+    # change, a widespread outage) rather than a handful of unlucky
+    # symbols — worth a distinct error alert on top of the routine
+    # data-collection summary above.
+    if symbols and len(snapshot_failed) / len(symbols) > 0.5:
+        telegram_send(format_error(
+            "data collection",
+            RuntimeError(f"{len(snapshot_failed)}/{len(symbols)} snapshots failed this run")
+        ))
 
     # Resolve mature observations using future candle OHLC.
     grouped = unresolved_predictions()
+    resolved_total = 0
 
     for symbol, predictions in grouped.items():
-        resolve_symbol(
-            symbol,
-            predictions
-        )
+        try:
+            count = resolve_symbol(symbol, predictions)
+            resolved_total += count or 0
+        except Exception as exc:
+            log.warning("Resolution failed for %s: %s", symbol, exc)
+            errors.append((f"resolve/{symbol}", exc))
 
     # Retrain only after enough NEW resolved observations exist.
-    maybe_train()
+    # (sends its own 🧠 message internally on success)
+    try:
+        maybe_train()
+    except Exception as exc:
+        log.exception("Training failed: %s", exc)
+        telegram_send(format_error("training", exc))
+        errors.append(("training", exc))
 
     signals = []
 
@@ -2486,11 +2719,43 @@ def main():
                     strategy,
                     exc
                 )
+                errors.append((f"predict/{symbol}/{strategy}", exc))
+
+    # One aggregated error alert instead of one per failure, to avoid
+    # spamming — but every failure still gets logged individually above.
+    if errors:
+        summary = "\n".join(f"- {ctx}: {type(exc).__name__}: {str(exc)[:120]}" for ctx, exc in errors[:10])
+        extra = f"\n(+{len(errors) - 10} more)" if len(errors) > 10 else ""
+        telegram_send(f"⚠️ {len(errors)} error(s) this run\n{summary}{extra}")
+
+    # Self-scheduling health summary — fires roughly once every 24h
+    # regardless of how often this script itself gets triggered, so it
+    # works the same whether the scheduler is hourly, every 2 hours, etc.
+    last_summary_ms = get_system_marker("last_health_summary_ms")
+    now_ms = int(time.time() * 1000)
+
+    if now_ms - last_summary_ms >= 24 * 3600 * 1000:
+        try:
+            telegram_send(format_health_summary())
+            set_system_marker("last_health_summary_ms", now_ms)
+        except Exception as exc:
+            log.warning("Health summary failed: %s", exc)
+
+    duration_sec = time.time() - start_time
 
     log.info(
-        "V4 run completed | signals=%d",
-        len(signals)
+        "V4 run completed | signals=%d | duration=%.0fs",
+        len(signals),
+        duration_sec
     )
+
+    telegram_send(format_run_completed({
+        "duration_sec": duration_sec,
+        "universe": len(symbols),
+        "signals": len(signals),
+        "resolved": resolved_total,
+        "errors": len(errors)
+    }))
 
 
 if __name__ == "__main__":
