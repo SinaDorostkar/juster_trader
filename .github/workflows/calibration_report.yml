@@ -28,6 +28,7 @@ jobs:
       - name: Run calibration report
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          PROMOTE_SCORE: ${{ secrets.PROMOTE_SCORE }}
           YOUR_CHAT_ID: ${{ secrets.YOUR_CHAT_ID }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
