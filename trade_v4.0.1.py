@@ -66,7 +66,6 @@ STATIC_WATCHLIST = [
     "SOLUSDT", "XRPUSDT", "ADAUSDT", "TRXUSDT", "BNBUSDT"
 ]
 
-SCAN_TOP_N = 40
 MIN_24H_VOLUME_USD = 5_000_000
 
 STRATEGIES = {
@@ -126,6 +125,55 @@ MAJORS = {"BTCUSDT", "ETHUSDT"}
 
 MIN_EV = float(os.getenv("MIN_EV", "0.002"))
 MIN_MICRO_HISTORY = int(os.getenv("MIN_MICRO_HISTORY", "24"))
+
+# Snapshots are meant to land on a fixed 1-hour grid (see collect_snapshot's
+# bucket_ms). Anything pulled in dynamically via SCAN_TOP_N — as opposed to
+# the STATIC_WATCHLIST, which is always included — can drop out of the top
+# ranking for a stretch and miss snapshots entirely. Allow one occasional
+# missed run (a transient API failure) without penalty, but reject a
+# sequence whose rows aren't roughly evenly spaced, rather than silently
+# feed the model a multi-day price move mislabeled as a normal ~1h step.
+MAX_SNAPSHOT_GAP_MS = 2 * 3_600_000
+
+# ------------------------------------------------------------
+# Candidate lifecycle: Core / Scout / Incubator / Promoted / Dormant
+# ------------------------------------------------------------
+# A coin sitting right at a ranking boundary shouldn't flap in and out
+# of tracking every run — that's what produced the snapshot gaps fixed
+# earlier. Entry and exit use DIFFERENT thresholds (hysteresis): easier
+# to fall below the exit bar than to clear the entry bar in the first
+# place, so genuine boundary noise doesn't cause repeated cold starts.
+PROMOTE_SCORE = float(os.getenv("PROMOTE_SCORE", "0.55"))
+DEMOTE_SCORE = float(os.getenv("DEMOTE_SCORE", "0.35"))
+CONSECUTIVE_TO_INCUBATE = int(os.getenv("CONSECUTIVE_TO_INCUBATE", "3"))
+CONSECUTIVE_TO_DORMANT = int(os.getenv("CONSECUTIVE_TO_DORMANT", "3"))
+
+# How many brand-new candidates can be discovered per run, and the hard
+# cap on total tracked universe size (beyond Core) — both bound the
+# extra per-run API cost of scoring (one daily-OHLC call per tracked
+# candidate), since that's now the main new cost this mechanism adds.
+NEW_DISCOVERIES_PER_RUN = int(os.getenv("NEW_DISCOVERIES_PER_RUN", "20"))
+MAX_TRACKED_CANDIDATES = int(os.getenv("MAX_TRACKED_CANDIDATES", "120"))
+
+# Scoring weights. "Persistence" was deliberately dropped as a scored
+# component — it's now the CONSECUTIVE_TO_* state-transition logic
+# above instead, which is a more direct and separately-tunable way to
+# get the same anti-flapping effect than diluting it into a weighted
+# average. The 5% freed up went to liquidity, since thin books directly
+# undermine ATR-based target/stop reliability and position sizing —
+# the most "hard constraint"-like of the components.
+CANDIDATE_WEIGHTS = {
+    "liquidity": 0.35,
+    "relative_volume": 0.20,
+    "trend_momentum": 0.20,
+    "volatility_quality": 0.15,
+    "market_relative_strength": 0.10,
+}
+
+# Retention — the main sources of unbounded growth in this system.
+SNAPSHOT_RETENTION_DAYS = int(os.getenv("SNAPSHOT_RETENTION_DAYS", "30"))
+PREDICTION_RETENTION_MONTHS = int(os.getenv("PREDICTION_RETENTION_MONTHS", "18"))
+DORMANT_RETENTION_DAYS = int(os.getenv("DORMANT_RETENTION_DAYS", "14"))
 
 RETRAIN_EVERY = int(os.getenv("RETRAIN_EVERY", "50"))
 MIN_TRAIN_SAMPLES = int(os.getenv("MIN_TRAIN_SAMPLES", "250"))
@@ -254,6 +302,35 @@ def init_db():
     """)
 
     db_execute("""
+    CREATE TABLE IF NOT EXISTS candidate_state_v401 (
+        symbol TEXT PRIMARY KEY,
+        state TEXT NOT NULL DEFAULT 'scout',
+        score REAL,
+        consecutive_qualify INTEGER DEFAULT 0,
+        consecutive_disqualify INTEGER DEFAULT 0,
+        first_seen_ms INTEGER,
+        state_changed_ms INTEGER,
+        last_scored_ms INTEGER
+    )
+    """)
+
+    # Append-only — candidate_state_v401 only ever stores each symbol's
+    # CURRENT score (upsert), so without this there is no way to later
+    # ask "did coins that scored well at promotion time actually turn
+    # out well." This is what makes PROMOTE_SCORE/DEMOTE_SCORE
+    # calibration possible at all.
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS candidate_score_history_v401 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        score REAL,
+        state_before TEXT,
+        state_after TEXT,
+        logged_ms INTEGER
+    )
+    """)
+
+    db_execute("""
     CREATE TABLE IF NOT EXISTS system_state_v401 (
         key TEXT PRIMARY KEY,
         value INTEGER
@@ -366,7 +443,165 @@ def kraken_pair_name(symbol):
     return info["kraken_pair"]
 
 
-def get_top_symbols():
+def score_liquidity(usd_volume_24h):
+    if usd_volume_24h <= 0:
+        return 0.0
+    # log-scaled, saturating around $50M/24h as "excellent" liquidity
+    return float(min(1.0, math.log10(usd_volume_24h + 1) / math.log10(50_000_000)))
+
+
+def score_relative_volume(daily):
+    if daily is None or len(daily) < 8:
+        return 0.0
+    volumes = daily["volume"].astype(float).values
+    today = volumes[-1]
+    baseline = float(np.mean(volumes[-8:-1]))
+    if baseline <= 0:
+        return 0.0
+    ratio = today / baseline
+    return float(1.0 / (1.0 + math.exp(-2.0 * (ratio - 1.0))))
+
+
+def score_trend_momentum(daily):
+    # Deliberately coarse and multi-day — a distinct timescale from the
+    # model's own hourly/4h momentum features (RSI/MACD/ADX). This is
+    # "is this coin alive enough to deserve tracking," not "is this a
+    # good entry right now" — using the same signal for both would bias
+    # what the model ever gets to learn from toward coins that already
+    # look like they're trending.
+    if daily is None or len(daily) < 8:
+        return 0.5
+    close = daily["close"].astype(float).values
+    ret7 = math.log(close[-1] / close[-8]) if close[-8] > 0 else 0.0
+    return float(1.0 / (1.0 + math.exp(-8.0 * ret7)))
+
+
+def score_volatility_quality(daily):
+    if daily is None or len(daily) < 8:
+        return 0.0
+    high = daily["high"].astype(float).values[-8:]
+    low = daily["low"].astype(float).values[-8:]
+    close = daily["close"].astype(float).values[-8:]
+    ranges = (high - low) / np.where(close > 0, close, 1.0)
+    avg_range = float(np.mean(ranges))
+    consistency = 1.0 - min(1.0, float(np.std(ranges) / (avg_range + 1e-9)))
+    # Want SOME real movement (not a dead coin), but consistent day to
+    # day rather than one wild outlier candle driving the whole window
+    # — the latter is the signature of a thin-liquidity flash move, not
+    # genuine price discovery.
+    magnitude = 1.0 - math.exp(-15.0 * avg_range)
+    return float(max(0.0, min(1.0, 0.5 * magnitude + 0.5 * consistency)))
+
+
+def score_market_relative_strength(daily, btc_context):
+    if daily is None or len(daily) < 8:
+        return 0.5
+    close = daily["close"].astype(float).values
+    coin_ret = math.log(close[-1] / close[-8]) if close[-8] > 0 else 0.0
+    btc_ret24, _, _ = btc_context
+    relative = coin_ret - btc_ret24
+    return float(1.0 / (1.0 + math.exp(-8.0 * relative)))
+
+
+def compute_candidate_score(usd_volume_24h, daily, btc_context):
+    parts = {
+        "liquidity": score_liquidity(usd_volume_24h),
+        "relative_volume": score_relative_volume(daily),
+        "trend_momentum": score_trend_momentum(daily),
+        "volatility_quality": score_volatility_quality(daily),
+        "market_relative_strength": score_market_relative_strength(daily, btc_context),
+    }
+    score = sum(CANDIDATE_WEIGHTS[k] * v for k, v in parts.items())
+    return float(score), parts
+
+
+def has_enough_micro_history(symbol, as_of_ms):
+    micro, _ = build_micro_sequence(symbol, MIN_MICRO_HISTORY, as_of_ms)
+    return micro is not None
+
+
+def get_candidate_state(symbol):
+    rows = db_query("""
+        SELECT state, score, consecutive_qualify, consecutive_disqualify,
+               first_seen_ms, state_changed_ms
+        FROM candidate_state_v401 WHERE symbol=?
+    """, (symbol,))
+    return rows[0] if rows else None
+
+
+def upsert_candidate_state(symbol, state, score, cq, cd, first_seen_ms, state_changed_ms, now_ms):
+    db_execute("""
+    INSERT INTO candidate_state_v401
+        (symbol, state, score, consecutive_qualify, consecutive_disqualify,
+         first_seen_ms, state_changed_ms, last_scored_ms)
+    VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(symbol) DO UPDATE SET
+        state=excluded.state, score=excluded.score,
+        consecutive_qualify=excluded.consecutive_qualify,
+        consecutive_disqualify=excluded.consecutive_disqualify,
+        state_changed_ms=excluded.state_changed_ms,
+        last_scored_ms=excluded.last_scored_ms
+    """, (symbol, state, score, cq, cd, first_seen_ms, state_changed_ms, now_ms))
+
+
+def advance_candidate(symbol, score, now_ms):
+    """One coin, one run: update its score, consecutive counters, and
+    state. Promotion out of Incubator requires BOTH a healthy score AND
+    enough contiguous snapshot history — the data-availability half of
+    'don't predict on a new coin until enough data has been collected',
+    checked by directly attempting a micro-sequence build rather than
+    re-deriving the gap logic here."""
+    existing = get_candidate_state(symbol)
+
+    if existing is None:
+        state, cq, cd, first_seen, changed = "scout", 0, 0, now_ms, now_ms
+    else:
+        state, _prev_score, cq, cd, first_seen, changed = existing
+
+    if state == "core":
+        upsert_candidate_state(symbol, "core", score, cq, cd, first_seen, changed, now_ms)
+        return "core"
+
+    qualifies = score >= PROMOTE_SCORE
+    disqualifies = score < DEMOTE_SCORE
+
+    cq = cq + 1 if qualifies else 0
+    cd = cd + 1 if disqualifies else 0
+
+    new_state = state
+
+    if state in ("scout", "dormant") and cq >= CONSECUTIVE_TO_INCUBATE:
+        new_state = "incubator"
+    elif state == "incubator":
+        if cd >= CONSECUTIVE_TO_DORMANT:
+            new_state = "dormant"
+        elif has_enough_micro_history(symbol, now_ms):
+            new_state = "promoted"
+    elif state == "promoted":
+        if cd >= CONSECUTIVE_TO_DORMANT:
+            new_state = "dormant"
+
+    if new_state != state:
+        changed = now_ms
+        log.info("%s: %s -> %s (score=%.3f)", symbol, state, new_state, score)
+
+    upsert_candidate_state(symbol, new_state, score, cq, cd, first_seen, changed, now_ms)
+
+    db_execute("""
+        INSERT INTO candidate_score_history_v401 (symbol, score, state_before, state_after, logged_ms)
+        VALUES (?,?,?,?,?)
+    """, (symbol, score, state, new_state, now_ms))
+
+    return new_state
+
+
+def discover_and_score():
+    """Replaces the old flat top-N cutoff. Returns (snapshot_targets,
+    predict_targets, exchange_info, state_counts) where snapshot_targets
+    = everyone who should get a market snapshot this run (core, incubator,
+    promoted — NOT scout, which is deliberately cheap and depth-call-free,
+    and NOT dormant, which has been actively de-prioritized), and
+    predict_targets = everyone eligible for actual signals (core, promoted)."""
     valid = kraken_pairs()
 
     try:
@@ -376,41 +611,216 @@ def get_top_symbols():
         log.warning("Could not fetch Kraken tickers: %s", exc)
         ticker_result = {}
 
-    candidates = []
-
+    volumes = {}
     for canonical, info in valid.items():
         ticker = ticker_result.get(info["kraken_pair"])
-
         if not ticker:
             continue
-
         try:
             last_price = float(ticker["c"][0])
             base_volume_24h = float(ticker["v"][1])
-            usd_volume = last_price * base_volume_24h
+            volumes[canonical] = last_price * base_volume_24h
         except Exception:
             continue
 
-        if usd_volume >= MIN_24H_VOLUME_USD:
-            candidates.append((canonical, usd_volume))
+    tracked = {row[0] for row in db_query("SELECT symbol FROM candidate_state_v401")}
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    # Discover a bounded number of new candidates per run, ranked by raw
+    # 24h volume as a cheap first filter (the full score needs a daily
+    # OHLC pull, which is the real per-symbol cost — no point spending it
+    # on obviously-illiquid pairs).
+    if len(tracked) < MAX_TRACKED_CANDIDATES:
+        room = MAX_TRACKED_CANDIDATES - len(tracked)
+        discoverable = sorted(
+            (s for s in volumes if s not in tracked and s not in STATIC_WATCHLIST
+             and volumes[s] >= MIN_24H_VOLUME_USD),
+            key=lambda s: volumes[s], reverse=True
+        )
+        for symbol in discoverable[:min(NEW_DISCOVERIES_PER_RUN, room)]:
+            tracked.add(symbol)
 
-    result = []
+    btc_context = btc_regime()
+    now_ms = int(time.time() * 1000)
 
-    # Always prioritize the original watchlist if valid.
-    for symbol in STATIC_WATCHLIST:
-        if symbol in valid and symbol not in result:
-            result.append(symbol)
+    all_symbols = set(STATIC_WATCHLIST) | tracked
+    state_counts = {"core": 0, "scout": 0, "incubator": 0, "promoted": 0, "dormant": 0}
 
-    for symbol, _ in candidates:
-        if symbol not in result:
-            result.append(symbol)
+    for symbol in all_symbols:
+        if symbol not in valid:
+            continue
 
-        if len(result) >= SCAN_TOP_N:
-            break
+        existing = get_candidate_state(symbol)
+        is_core = symbol in STATIC_WATCHLIST
 
-    return result[:SCAN_TOP_N], valid
+        if is_core and existing is None:
+            upsert_candidate_state(symbol, "core", 1.0, 0, 0, now_ms, now_ms, now_ms)
+
+        try:
+            daily = get_klines(symbol, "1d", 10)
+        except Exception as exc:
+            log.warning("Could not score %s: %s", symbol, exc)
+            daily = None
+
+        score, _parts = compute_candidate_score(volumes.get(symbol, 0.0), daily, btc_context)
+        state = advance_candidate(symbol, score, now_ms)
+        state_counts[state] = state_counts.get(state, 0) + 1
+
+    snapshot_targets = [
+        row[0] for row in db_query(
+            "SELECT symbol FROM candidate_state_v401 WHERE state IN ('core','incubator','promoted')"
+        )
+    ]
+    predict_targets = [
+        row[0] for row in db_query(
+            "SELECT symbol FROM candidate_state_v401 WHERE state IN ('core','promoted')"
+        )
+    ]
+
+    return snapshot_targets, predict_targets, valid, state_counts, btc_context
+
+
+def cleanup_old_data():
+    """The main sources of unbounded growth: hourly snapshots, resolved
+    predictions, and dormant candidates that never returned.
+
+    Snapshots are unaffected by training concerns — every consumer of
+    market_snapshots_v401 (build_micro_sequence, previous_snapshot,
+    micro_static_as_of) only ever looks back MIN_MICRO_HISTORY hours.
+    Training never touches this table at all; it reads its own frozen
+    sequence_json/static_json copy stored in predictions_v401 at
+    prediction time, so pruning old snapshots can't affect retraining.
+
+    A resolved prediction is only ever pruned once it satisfies ALL of:
+      - trained=1 (already used in at least one training run) — a row
+        that hasn't been learned from yet is NEVER deleted regardless
+        of age, since new_training_examples() counts exactly these
+        trained=0 rows to decide when to retrain; deleting one before
+        it's had its turn would silently discard real training signal
+      - outside the most recent MAX_TRAIN_SAMPLES for its strategy —
+        the actual working set get_training_rows() draws from, so
+        nothing currently in active use is ever at risk even if total
+        volume stays below that cap for longer than the retention window
+      - older than the age-based retention window
+    """
+    now_ms = int(time.time() * 1000)
+
+    db_execute(
+        "DELETE FROM market_snapshots_v401 WHERE snapshot_ms < ?",
+        (now_ms - SNAPSHOT_RETENTION_DAYS * 24 * 3600 * 1000,)
+    )
+
+    db_execute(
+        "DELETE FROM candidate_score_history_v401 WHERE logged_ms < ?",
+        (now_ms - PREDICTION_RETENTION_MONTHS * 30 * 24 * 3600 * 1000,)
+    )
+
+    age_cutoff = now_ms - PREDICTION_RETENTION_MONTHS * 30 * 24 * 3600 * 1000
+    pruned_predictions = 0
+
+    for strategy in STRATEGIES:
+        # train_candidate=1 rows are the ones that can actually become
+        # training examples — protect them until trained=1 (see
+        # train_strategy's final UPDATE) AND until they're outside the
+        # recent MAX_TRAIN_SAMPLES window get_training_rows() draws from.
+        keep_rows = db_query("""
+            SELECT id FROM predictions_v401
+            WHERE strategy=? AND resolved=1 AND train_candidate=1
+            ORDER BY source_close_ms DESC LIMIT ?
+        """, (strategy, MAX_TRAIN_SAMPLES))
+        keep_ids = {row[0] for row in keep_rows}
+
+        trainable_old = db_query("""
+            SELECT id FROM predictions_v401
+            WHERE strategy=? AND resolved=1 AND train_candidate=1
+              AND trained=1 AND resolved_at < ?
+        """, (strategy, age_cutoff))
+
+        # train_candidate=0 rows are deliberately excluded from training
+        # by the temporal-stride dedup (predict_signal) and — critically —
+        # NEVER get trained=1 set by anything, since train_strategy's
+        # UPDATE only touches train_candidate=1 rows. Gating their
+        # deletion on trained=1 would mean they never get pruned at all,
+        # regardless of age. Their only remaining purpose is calibration
+        # (which reads all resolved rows, not just train_candidate=1 —
+        # see calibration_report.py), so plain age governs them.
+        non_trainable_old = db_query("""
+            SELECT id FROM predictions_v401
+            WHERE strategy=? AND resolved=1 AND train_candidate=0
+              AND resolved_at < ?
+        """, (strategy, age_cutoff))
+
+        to_delete = [row[0] for row in trainable_old if row[0] not in keep_ids]
+        to_delete += [row[0] for row in non_trainable_old]
+
+        for i in range(0, len(to_delete), 500):
+            chunk = to_delete[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            db_execute(f"DELETE FROM predictions_v401 WHERE id IN ({placeholders})", tuple(chunk))
+
+        pruned_predictions += len(to_delete)
+
+    # Separate issue found while auditing this: resolve_symbol() silently
+    # gives up (logs a warning, returns) if get_klines() ever fails for a
+    # symbol — most commonly because it's been delisted mid-holding-period
+    # — leaving that prediction unresolved forever with no age-based
+    # pruning path able to touch it (the block above only ever looks at
+    # resolved=1 rows). A row sitting unresolved for many multiples of
+    # its own strategy's timeout window is almost certainly stuck, not
+    # legitimately still pending — mark it abandoned (no fabricated
+    # outcome, excluded from training) instead of deleting it outright,
+    # consistent with this file's existing preference for marking over
+    # silent removal (see the trained flag itself).
+    abandoned_total = 0
+
+    for strategy, cfg in STRATEGIES.items():
+        abandon_cutoff = now_ms - 5 * cfg["timeout_h"] * 3600 * 1000
+
+        stuck = db_query("""
+            SELECT id FROM predictions_v401
+            WHERE strategy=? AND resolved=0 AND source_close_ms < ?
+        """, (strategy, abandon_cutoff))
+        stuck_ids = [row[0] for row in stuck]
+
+        for i in range(0, len(stuck_ids), 500):
+            chunk = stuck_ids[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            db_execute(
+                f"""UPDATE predictions_v401 SET resolved=1, outcome_type='abandoned',
+                    resolved_at=?, train_candidate=0 WHERE id IN ({placeholders})""",
+                (now_ms, *chunk)
+            )
+
+        abandoned_total += len(stuck_ids)
+
+    dormant_cutoff = now_ms - DORMANT_RETENTION_DAYS * 24 * 3600 * 1000
+    long_dormant = db_query(
+        "SELECT symbol FROM candidate_state_v401 WHERE state='dormant' AND state_changed_ms < ?",
+        (dormant_cutoff,)
+    )
+
+    for (symbol,) in long_dormant:
+        # Fully forgotten — if it ever recovers, it re-enters as a new
+        # Scout from scratch, same as any coin we've never seen before.
+        db_execute("DELETE FROM market_snapshots_v401 WHERE symbol=?", (symbol,))
+        db_execute("DELETE FROM candidate_state_v401 WHERE symbol=?", (symbol,))
+
+    # Delisted symbols: no longer a valid Kraken pair at all.
+    valid = kraken_pairs()
+    tracked = db_query("SELECT symbol FROM candidate_state_v401")
+    for (symbol,) in tracked:
+        if symbol not in valid and symbol not in STATIC_WATCHLIST:
+            db_execute("DELETE FROM market_snapshots_v401 WHERE symbol=?", (symbol,))
+            db_execute("DELETE FROM candidate_state_v401 WHERE symbol=?", (symbol,))
+
+    log.info(
+        "Cleanup: pruned %d resolved predictions, abandoned %d stuck-unresolved, "
+        "forgot %d long-dormant candidates",
+        pruned_predictions,
+        abandoned_total,
+        len(long_dormant)
+    )
+
+    return len(long_dormant)
 
 
 def get_klines(symbol, interval, limit=500, start_ms=None, end_ms=None):
@@ -917,6 +1327,18 @@ def build_micro_sequence(symbol, length, as_of_ms):
     rows = list(reversed(rows))
     if len(rows) < MIN_MICRO_HISTORY:
         return None, None
+
+    gaps = [rows[i][0] - rows[i - 1][0] for i in range(1, len(rows))]
+    max_gap = max(gaps) if gaps else 0
+    if max_gap > MAX_SNAPSHOT_GAP_MS:
+        log.warning(
+            "%s: micro sequence rejected — %.1fh gap between snapshots "
+            "(likely dropped out of the scanned watchlist for a stretch)",
+            symbol,
+            max_gap / 3_600_000,
+        )
+        return None, None
+
     values = []
     for index, row in enumerate(rows):
         snapshot_ms, obi5, obi10, obi20, obi50, obi100, spread_bps, book_age_sec, funding, oi_change, price = row
@@ -2622,24 +3044,28 @@ def main():
     # before any Telegram code ever ran, so there was no notification at
     # all. Now a failure here is reported before the process exits.
     try:
-        symbols, exchange_info = get_top_symbols()
-        btc_context = btc_regime()
+        snapshot_targets, predict_targets, exchange_info, state_counts, btc_context = discover_and_score()
     except Exception as exc:
         log.exception("Fatal setup failure: %s", exc)
-        telegram_send(format_error("startup (get_top_symbols / btc_regime)", exc))
+        telegram_send(format_error("startup (discover_and_score)", exc))
         raise
 
     log.info(
-        "Universe: %d symbols",
-        len(symbols)
+        "Universe: %d snapshot targets, %d prediction-eligible | states=%s",
+        len(snapshot_targets),
+        len(predict_targets),
+        state_counts
     )
 
     # Collect one historical microstructure observation per symbol
-    # per hourly bucket.
+    # per hourly bucket — core/incubator/promoted only. Scout coins are
+    # scored using cheap ticker+daily-OHLC data alone (no order-book
+    # calls) until they've proven themselves worth the extra cost;
+    # dormant coins are skipped entirely.
     snapshot_ok = 0
     snapshot_failed = []
 
-    for symbol in symbols:
+    for symbol in snapshot_targets:
         try:
             collect_snapshot(
                 symbol,
@@ -2655,17 +3081,20 @@ def main():
             snapshot_failed.append(symbol)
 
     telegram_send(
-        format_data_collection(snapshot_ok, len(snapshot_failed), snapshot_failed, len(symbols))
+        format_data_collection(snapshot_ok, len(snapshot_failed), snapshot_failed, len(snapshot_targets))
+        + f"\nStates: core={state_counts.get('core',0)} scout={state_counts.get('scout',0)} "
+          f"incubator={state_counts.get('incubator',0)} promoted={state_counts.get('promoted',0)} "
+          f"dormant={state_counts.get('dormant',0)}"
     )
 
     # A large fraction of failures suggests something systemic (an API
     # change, a widespread outage) rather than a handful of unlucky
     # symbols — worth a distinct error alert on top of the routine
     # data-collection summary above.
-    if symbols and len(snapshot_failed) / len(symbols) > 0.5:
+    if snapshot_targets and len(snapshot_failed) / len(snapshot_targets) > 0.5:
         telegram_send(format_error(
             "data collection",
-            RuntimeError(f"{len(snapshot_failed)}/{len(symbols)} snapshots failed this run")
+            RuntimeError(f"{len(snapshot_failed)}/{len(snapshot_targets)} snapshots failed this run")
         ))
 
     # Resolve mature observations using future candle OHLC.
@@ -2691,7 +3120,7 @@ def main():
 
     signals = []
 
-    for symbol in symbols:
+    for symbol in predict_targets:
         for strategy in STRATEGIES:
             try:
                 signal = predict_signal(
@@ -2743,15 +3172,18 @@ def main():
 
     duration_sec = time.time() - start_time
 
+    purged_dormant = cleanup_old_data()
+
     log.info(
-        "V4 run completed | signals=%d | duration=%.0fs",
+        "V4 run completed | signals=%d | duration=%.0fs | purged_dormant=%d",
         len(signals),
-        duration_sec
+        duration_sec,
+        purged_dormant
     )
 
     telegram_send(format_run_completed({
         "duration_sec": duration_sec,
-        "universe": len(symbols),
+        "universe": len(snapshot_targets),
         "signals": len(signals),
         "resolved": resolved_total,
         "errors": len(errors)
