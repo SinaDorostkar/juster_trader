@@ -202,8 +202,7 @@ def subsequent_performance(symbol, promoted_ms):
     return float(np.mean(realized)), len(rows)
 
 
-def get_promote_score():
-    return 0.55  # PROMOTE_SCORE's current default — see note below
+PROMOTE_SCORE = float(os.getenv("PROMOTE_SCORE", "0.55"))
 
 
 def propose_score_threshold(bucket_summary, current_score):
@@ -251,7 +250,7 @@ def report_promote_score():
     summary = df.groupby('bucket', observed=True).agg(
         n_promotions=('symbol', 'size'), avg_expectancy=('expectancy', 'mean'))
 
-    current_score = get_promote_score()
+    current_score = PROMOTE_SCORE
     proposed = propose_score_threshold(summary, current_score)
 
     fig, ax = plt.subplots()
