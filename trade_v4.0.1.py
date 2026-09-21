@@ -6,6 +6,7 @@ import random
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
@@ -134,6 +135,35 @@ MIN_MICRO_HISTORY = int(os.getenv("MIN_MICRO_HISTORY", "24"))
 # sequence whose rows aren't roughly evenly spaced, rather than silently
 # feed the model a multi-day price move mislabeled as a normal ~1h step.
 MAX_SNAPSHOT_GAP_MS = 2 * 3_600_000
+
+# I/O-bound network waits, not CPU work — Python releases the GIL during
+# a blocking request, so this doesn't need to match the runner's CPU
+# core count (GitHub's free ubuntu-latest runners have 2). Kept modest
+# specifically to stay well inside Kraken's own rate limits rather than
+# to respect any CPU constraint.
+KRAKEN_THREAD_WORKERS = int(os.getenv("KRAKEN_THREAD_WORKERS", "8"))
+
+
+def parallel_fetch(items, fetch_fn, max_workers=KRAKEN_THREAD_WORKERS):
+    """Runs fetch_fn(item) concurrently across items. ONLY ever used for
+    pure Kraken network calls — never anything touching the Turso
+    connection, since its thread-safety under concurrent use isn't
+    confirmed and a race there would be a far worse outcome than a slow
+    run. Returns {item: result_or_None}; a failed fetch logs a warning
+    and maps to None rather than aborting the whole batch."""
+    results = {}
+    if not items:
+        return results
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(fetch_fn, item): item for item in items}
+        for future in as_completed(future_map):
+            item = future_map[future]
+            try:
+                results[item] = future.result()
+            except Exception as exc:
+                log.warning("Parallel fetch failed for %s: %s", item, exc)
+                results[item] = None
+    return results
 
 # ------------------------------------------------------------
 # Candidate lifecycle: Core / Scout / Incubator / Promoted / Dormant
@@ -645,6 +675,14 @@ def discover_and_score():
     all_symbols = set(STATIC_WATCHLIST) | tracked
     state_counts = {"core": 0, "scout": 0, "incubator": 0, "promoted": 0, "dormant": 0}
 
+    # Pure network fetch, no DB involved — safe to parallelize. This is
+    # the main per-run cost of discovery (one call per tracked candidate),
+    # now done concurrently instead of one at a time.
+    daily_cache = parallel_fetch(
+        [s for s in all_symbols if s in valid],
+        lambda s: get_klines(s, "1d", 10)
+    )
+
     for symbol in all_symbols:
         if symbol not in valid:
             continue
@@ -655,11 +693,7 @@ def discover_and_score():
         if is_core and existing is None:
             upsert_candidate_state(symbol, "core", 1.0, 0, 0, now_ms, now_ms, now_ms)
 
-        try:
-            daily = get_klines(symbol, "1d", 10)
-        except Exception as exc:
-            log.warning("Could not score %s: %s", symbol, exc)
-            daily = None
+        daily = daily_cache.get(symbol)
 
         score, _parts = compute_candidate_score(volumes.get(symbol, 0.0), daily, btc_context)
         state = advance_candidate(symbol, score, now_ms)
@@ -1236,7 +1270,7 @@ def previous_snapshot(symbol, before_ms=None):
     return rows[0] if rows else None
 
 
-def collect_snapshot(symbol, btc_context):
+def collect_snapshot(symbol, btc_context, price=None, depth=None):
     now_ms = int(time.time() * 1000)
 
     # One observation per UTC hour.
@@ -1254,9 +1288,11 @@ def collect_snapshot(symbol, btc_context):
         return
 
     try:
-        price = get_price(symbol)
+        if price is None:
+            price = get_price(symbol)
 
-        depth = get_depth(symbol, 100)
+        if depth is None:
+            depth = get_depth(symbol, 100)
         obi, spread_bps, book_age_sec = orderbook_features(depth)
 
         funding = get_funding(symbol)
@@ -1399,6 +1435,29 @@ def get_klines_cached(symbol, interval):
         limit = min(_max_seq_length(interval) + 100, 1000)
         _klines_cache[key] = get_klines(symbol, interval, limit)
     return _klines_cache[key]
+
+
+def prewarm_klines_cache(symbols):
+    """Fetches every (symbol, interval) combination the prediction phase
+    will need, concurrently, BEFORE the sequential predict_signal loop
+    runs — so every get_klines_cached() call during that loop is a pure
+    cache hit with no network wait. This is the parallel half of the
+    same cache get_klines_cached reads from; nothing here touches Turso."""
+    intervals = set()
+    for cfg in STRATEGIES.values():
+        intervals.update(cfg["seq"].keys())
+
+    tasks = [(symbol, interval) for symbol in symbols for interval in intervals]
+
+    def fetch_one(task):
+        symbol, interval = task
+        limit = min(_max_seq_length(interval) + 100, 1000)
+        return get_klines(symbol, interval, limit)
+
+    results = parallel_fetch(tasks, fetch_one)
+    for task, df in results.items():
+        if df is not None:
+            _klines_cache[task] = df
 
 
 def make_price_sequence(symbol, interval, length, end_ms=None):
@@ -2725,14 +2784,15 @@ def unresolved_predictions():
     return result
 
 
-def resolve_symbol(symbol,predictions):
+def resolve_symbol(symbol,predictions,future=None):
     if not predictions: return
     earliest_source=min(int(r[4]) for r in predictions)
-    try:
-        future=get_klines(symbol,"1h",1000,start_ms=earliest_source+1)
-    except Exception as exc:
-        log.warning("Could not resolve %s: %s",symbol,exc); return
-    if future.empty: return
+    if future is None:
+        try:
+            future=get_klines(symbol,"1h",1000,start_ms=earliest_source+1)
+        except Exception as exc:
+            log.warning("Could not resolve %s: %s",symbol,exc); return
+    if future is None or future.empty: return
     now_ms=int(time.time()*1000)
     resolved_count=0
     for row in predictions:
@@ -3090,11 +3150,19 @@ def main():
     snapshot_ok = 0
     snapshot_failed = []
 
+    # Pure network fetches, no DB — safe to parallelize. Pre-warms price
+    # and depth for every snapshot target before the sequential loop
+    # that actually writes to Turso runs.
+    price_cache = parallel_fetch(snapshot_targets, get_price)
+    depth_cache = parallel_fetch(snapshot_targets, lambda s: get_depth(s, 100))
+
     for symbol in snapshot_targets:
         try:
             collect_snapshot(
                 symbol,
-                btc_context
+                btc_context,
+                price=price_cache.get(symbol),
+                depth=depth_cache.get(symbol)
             )
             snapshot_ok += 1
         except Exception as exc:
@@ -3126,9 +3194,18 @@ def main():
     grouped = unresolved_predictions()
     resolved_total = 0
 
+    # Each symbol needs a different start_ms (its own earliest unresolved
+    # prediction), but the fetches themselves are still independent, pure
+    # network calls — safe to run concurrently before the sequential
+    # resolve loop that writes outcomes to Turso.
+    future_cache = parallel_fetch(
+        list(grouped.keys()),
+        lambda s: get_klines(s, "1h", 1000, start_ms=min(int(r[4]) for r in grouped[s]) + 1)
+    )
+
     for symbol, predictions in grouped.items():
         try:
-            count = resolve_symbol(symbol, predictions)
+            count = resolve_symbol(symbol, predictions, future=future_cache.get(symbol))
             resolved_total += count or 0
         except Exception as exc:
             log.warning("Resolution failed for %s: %s", symbol, exc)
@@ -3144,6 +3221,11 @@ def main():
         errors.append(("training", exc))
 
     signals = []
+
+    # Pre-warms 1h/4h/1d candles for every prediction target, concurrently,
+    # before the sequential loop below — so every predict_signal() call
+    # hits get_klines_cached() as a pure cache read with no network wait.
+    prewarm_klines_cache(predict_targets)
 
     for symbol in predict_targets:
         for strategy in STRATEGIES:
