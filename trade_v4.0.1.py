@@ -1376,8 +1376,33 @@ def current_micro_static(symbol):
 # MULTI-TIMEFRAME SAMPLE
 # ============================================================
 
+_klines_cache = {}
+
+
+def _max_seq_length(interval):
+    return max((cfg["seq"].get(interval, 0) for cfg in STRATEGIES.values()), default=0)
+
+
+def get_klines_cached(symbol, interval):
+    """Raw candle data for a given (symbol, interval) doesn't depend on
+    which strategy is asking, or on what end_ms cutoff gets applied
+    afterward — Kraken always just returns 'most recent N candles', and
+    end_ms is a client-side post-filter (get_klines/make_price_sequence
+    both already applied it this way; Kraken's OHLC endpoint has no
+    'until' parameter). day and swing both use 1h/4h/1d, with 4h and 1d
+    even wanting the exact same length — so without this cache, every
+    symbol's candles were being fetched from Kraken TWICE per run, once
+    per strategy, for identical data. This is the single biggest
+    fixable cost driver behind long run times."""
+    key = (symbol, interval)
+    if key not in _klines_cache:
+        limit = min(_max_seq_length(interval) + 100, 1000)
+        _klines_cache[key] = get_klines(symbol, interval, limit)
+    return _klines_cache[key]
+
+
 def make_price_sequence(symbol, interval, length, end_ms=None):
-    df = get_klines(symbol, interval, min(length + 100, 1000), end_ms=end_ms)
+    df = get_klines_cached(symbol, interval)
     if len(df) < length + 20:
         return None
     if end_ms is not None:
@@ -1397,7 +1422,7 @@ def build_sample(symbol, strategy, btc_context=None, decision_close_ms=None):
     # For live inference, anchor all modalities to the latest CLOSED primary
     # candle. For historical use, caller can provide an explicit anchor.
     if decision_close_ms is None:
-        primary_probe = get_klines(symbol, cfg["primary"], 5)
+        primary_probe = get_klines_cached(symbol, cfg["primary"])
         if primary_probe.empty:
             return None
         decision_close_ms = int(primary_probe["close_ms"].iloc[-1])
