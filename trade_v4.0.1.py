@@ -632,10 +632,14 @@ def discover_and_score():
     promoted — NOT scout, which is deliberately cheap and depth-call-free,
     and NOT dormant, which has been actively de-prioritized), and
     predict_targets = everyone eligible for actual signals (core, promoted)."""
+    t = time.perf_counter()
     valid = kraken_pairs()
+    log.info("TIMING kraken_pairs: %.2fs", time.perf_counter() - t)
 
     try:
+        t = time.perf_counter()
         tickers = api_get(KRAKEN_SPOT_BASE, "/0/public/Ticker")
+        log.info("TIMING ticker: %.2fs", time.perf_counter() - t)
         ticker_result = tickers.get("result", {})
     except Exception as exc:
         log.warning("Could not fetch Kraken tickers: %s", exc)
@@ -669,7 +673,9 @@ def discover_and_score():
         for symbol in discoverable[:min(NEW_DISCOVERIES_PER_RUN, room)]:
             tracked.add(symbol)
 
+    t = time.perf_counter()
     btc_context = btc_regime()
+    log.info("TIMING btc_regime: %.2fs", time.perf_counter() - t)
     now_ms = int(time.time() * 1000)
 
     all_symbols = set(STATIC_WATCHLIST) | tracked
@@ -678,11 +684,14 @@ def discover_and_score():
     # Pure network fetch, no DB involved — safe to parallelize. This is
     # the main per-run cost of discovery (one call per tracked candidate),
     # now done concurrently instead of one at a time.
+    t = time.perf_counter()
     daily_cache = parallel_fetch(
         [s for s in all_symbols if s in valid],
         lambda s: get_klines(s, "1d", 10)
     )
+    log.info("TIMING daily OHLC parallel: %.2fs", time.perf_counter() - t)
 
+    t = time.perf_counter()
     for symbol in all_symbols:
         if symbol not in valid:
             continue
@@ -698,6 +707,7 @@ def discover_and_score():
         score, _parts = compute_candidate_score(volumes.get(symbol, 0.0), daily, btc_context)
         state = advance_candidate(symbol, score, now_ms)
         state_counts[state] = state_counts.get(state, 0) + 1
+    log.info("TIMING candidate scoring + DB: %.2fs", time.perf_counter() - t)
 
     snapshot_targets = [
         row[0] for row in db_query(
@@ -3153,9 +3163,14 @@ def main():
     # Pure network fetches, no DB — safe to parallelize. Pre-warms price
     # and depth for every snapshot target before the sequential loop
     # that actually writes to Turso runs.
+    t = time.perf_counter()
     price_cache = parallel_fetch(snapshot_targets, get_price)
+    log.info("TIMING prices: %.2fs", time.perf_counter() - t)
+    t = time.perf_counter()
     depth_cache = parallel_fetch(snapshot_targets, lambda s: get_depth(s, 100))
+    log.info("TIMING depth: %.2fs", time.perf_counter() - t)
 
+    t = time.perf_counter()
     for symbol in snapshot_targets:
         try:
             collect_snapshot(
@@ -3172,6 +3187,7 @@ def main():
                 exc
             )
             snapshot_failed.append(symbol)
+    log.info("TIMING snapshot DB writes: %.2fs", time.perf_counter() - t)
 
     telegram_send(
         format_data_collection(snapshot_ok, len(snapshot_failed), snapshot_failed, len(snapshot_targets))
