@@ -248,42 +248,43 @@ def db_connect():
 
 
 def db_execute(sql, params=()):
+    """Run one write and commit it. Kept for isolated writes outside hot paths."""
     db = db_connect()
     cur = db.cursor()
     cur.execute(sql, params)
-
     try:
         db.commit()
     except Exception as exc:
         log.error("DB commit failed for statement %r: %s", sql[:120], exc)
         raise
-
     return cur
 
 
-def db_executemany(sql, rows):
-    rows = list(rows)
-    if not rows:
-        return None
-
+def db_execute_no_commit(sql, params=()):
+    """Run a write without committing; caller owns the transaction."""
     db = db_connect()
     cur = db.cursor()
-    cur.executemany(sql, rows)
-
-    try:
-        db.commit()
-    except Exception as exc:
-        log.error("DB batch commit failed for statement %r: %s", sql[:120], exc)
-        raise
-
+    cur.execute(sql, params)
     return cur
 
 
 def db_query(sql, params=()):
+    """Run a SELECT. Reads do not need a commit."""
     db = db_connect()
     cur = db.cursor()
     cur.execute(sql, params)
     return cur.fetchall()
+
+
+def db_commit():
+    db_connect().commit()
+
+
+def db_rollback():
+    try:
+        db_connect().rollback()
+    except Exception:
+        pass
 
 
 def init_db():
@@ -592,13 +593,44 @@ def upsert_candidate_state(symbol, state, score, cq, cd, first_seen_ms, state_ch
     """, (symbol, state, score, cq, cd, first_seen_ms, state_changed_ms, now_ms))
 
 
+def _micro_history_available(symbol, as_of_ms):
+    """Same eligibility test as has_enough_micro_history, but isolated for the hot path."""
+    micro, _ = build_micro_sequence(symbol, MIN_MICRO_HISTORY, as_of_ms)
+    return micro is not None
+
+
+def _batch_upsert_candidate_states(rows):
+    if not rows:
+        return
+    sql = """
+    INSERT INTO candidate_state_v401
+        (symbol, state, score, consecutive_qualify, consecutive_disqualify,
+         first_seen_ms, state_changed_ms, last_scored_ms)
+    VALUES """ + ",".join("(?,?,?,?,?,?,?,?)" for _ in rows) + """
+    ON CONFLICT(symbol) DO UPDATE SET
+        state=excluded.state, score=excluded.score,
+        consecutive_qualify=excluded.consecutive_qualify,
+        consecutive_disqualify=excluded.consecutive_disqualify,
+        state_changed_ms=excluded.state_changed_ms,
+        last_scored_ms=excluded.last_scored_ms
+    """
+    params = tuple(v for row in rows for v in row)
+    db_execute_no_commit(sql, params)
+
+
+def _batch_insert_candidate_history(rows):
+    if not rows:
+        return
+    sql = """
+    INSERT INTO candidate_score_history_v401
+        (symbol, score, state_before, state_after, logged_ms)
+    VALUES """ + ",".join("(?,?,?,?,?)" for _ in rows)
+    params = tuple(v for row in rows for v in row)
+    db_execute_no_commit(sql, params)
+
+
 def advance_candidate(symbol, score, now_ms):
-    """One coin, one run: update its score, consecutive counters, and
-    state. Promotion out of Incubator requires BOTH a healthy score AND
-    enough contiguous snapshot history — the data-availability half of
-    'don't predict on a new coin until enough data has been collected',
-    checked by directly attempting a micro-sequence build rather than
-    re-deriving the gap logic here."""
+    """Legacy single-symbol transition helper; hot discovery path batches its DB work."""
     existing = get_candidate_state(symbol)
 
     if existing is None:
@@ -612,10 +644,8 @@ def advance_candidate(symbol, score, now_ms):
 
     qualifies = score >= PROMOTE_SCORE
     disqualifies = score < DEMOTE_SCORE
-
     cq = cq + 1 if qualifies else 0
     cd = cd + 1 if disqualifies else 0
-
     new_state = state
 
     if state in ("scout", "dormant") and cq >= CONSECUTIVE_TO_INCUBATE:
@@ -634,22 +664,20 @@ def advance_candidate(symbol, score, now_ms):
         log.info("%s: %s -> %s (score=%.3f)", symbol, state, new_state, score)
 
     upsert_candidate_state(symbol, new_state, score, cq, cd, first_seen, changed, now_ms)
-
     db_execute("""
         INSERT INTO candidate_score_history_v401 (symbol, score, state_before, state_after, logged_ms)
         VALUES (?,?,?,?,?)
     """, (symbol, score, state, new_state, now_ms))
-
     return new_state
 
-
 def discover_and_score():
-    """Replaces the old flat top-N cutoff. Returns (snapshot_targets,
-    predict_targets, exchange_info, state_counts) where snapshot_targets
-    = everyone who should get a market snapshot this run (core, incubator,
-    promoted — NOT scout, which is deliberately cheap and depth-call-free,
-    and NOT dormant, which has been actively de-prioritized), and
-    predict_targets = everyone eligible for actual signals (core, promoted)."""
+    """Score candidates with one state read and one write transaction.
+
+    The expensive network fetches remain parallel; only Turso access is
+    batched. This preserves the state machine while removing the old
+    per-symbol SELECT + UPSERT + history INSERT + COMMIT pattern.
+    """
+    t0 = time.perf_counter()
     valid = kraken_pairs()
 
     try:
@@ -673,10 +701,6 @@ def discover_and_score():
 
     tracked = {row[0] for row in db_query("SELECT symbol FROM candidate_state_v401")}
 
-    # Discover a bounded number of new candidates per run, ranked by raw
-    # 24h volume as a cheap first filter (the full score needs a daily
-    # OHLC pull, which is the real per-symbol cost — no point spending it
-    # on obviously-illiquid pairs).
     if len(tracked) < MAX_TRACKED_CANDIDATES:
         room = MAX_TRACKED_CANDIDATES - len(tracked)
         discoverable = sorted(
@@ -689,33 +713,96 @@ def discover_and_score():
 
     btc_context = btc_regime()
     now_ms = int(time.time() * 1000)
-
     all_symbols = set(STATIC_WATCHLIST) | tracked
     state_counts = {"core": 0, "scout": 0, "incubator": 0, "promoted": 0, "dormant": 0}
 
-    # Pure network fetch, no DB involved — safe to parallelize. This is
-    # the main per-run cost of discovery (one call per tracked candidate),
-    # now done concurrently instead of one at a time.
     daily_cache = parallel_fetch(
         [s for s in all_symbols if s in valid],
         lambda s: get_klines(s, "1d", 10)
     )
 
+    # One state query for the whole candidate universe.
+    state_rows = db_query("""
+        SELECT symbol, state, score, consecutive_qualify, consecutive_disqualify,
+               first_seen_ms, state_changed_ms
+        FROM candidate_state_v401
+    """)
+    states = {row[0]: row[1:] for row in state_rows}
+
+    pending_states = []
+    pending_history = []
+
+    # Preserve the old state machine in Python, where it is cheap.
     for symbol in all_symbols:
         if symbol not in valid:
             continue
 
-        existing = get_candidate_state(symbol)
+        existing = states.get(symbol)
         is_core = symbol in STATIC_WATCHLIST
 
-        if is_core and existing is None:
-            upsert_candidate_state(symbol, "core", 1.0, 0, 0, now_ms, now_ms, now_ms)
+        if existing is None and is_core:
+            # The old code inserted core=1.0 and immediately read it back;
+            # final state is simply core with this run's actual score.
+            state, _prev_score, cq, cd, first_seen, changed = (
+                "core", None, 0, 0, now_ms, now_ms
+            )
+        elif existing is None:
+            state, _prev_score, cq, cd, first_seen, changed = (
+                "scout", None, 0, 0, now_ms, now_ms
+            )
+        else:
+            state, _prev_score, cq, cd, first_seen, changed = existing
 
         daily = daily_cache.get(symbol)
-
         score, _parts = compute_candidate_score(volumes.get(symbol, 0.0), daily, btc_context)
-        state = advance_candidate(symbol, score, now_ms)
-        state_counts[state] = state_counts.get(state, 0) + 1
+
+        if state == "core":
+            new_state = "core"
+        else:
+            qualifies = score >= PROMOTE_SCORE
+            disqualifies = score < DEMOTE_SCORE
+            cq = cq + 1 if qualifies else 0
+            cd = cd + 1 if disqualifies else 0
+            new_state = state
+
+            if state in ("scout", "dormant") and cq >= CONSECUTIVE_TO_INCUBATE:
+                new_state = "incubator"
+            elif state == "incubator":
+                if cd >= CONSECUTIVE_TO_DORMANT:
+                    new_state = "dormant"
+                elif _micro_history_available(symbol, now_ms):
+                    new_state = "promoted"
+            elif state == "promoted":
+                if cd >= CONSECUTIVE_TO_DORMANT:
+                    new_state = "dormant"
+
+        if new_state != state:
+            changed = now_ms
+            log.info("%s: %s -> %s (score=%.3f)", symbol, state, new_state, score)
+
+        pending_states.append((
+            symbol, new_state, score, cq, cd, first_seen, changed, now_ms
+        ))
+
+        # The original helper intentionally skipped history for core rows.
+        # Keep that exact behavior, including newly bootstrapped core coins.
+        if state != "core":
+            pending_history.append((symbol, score, state, new_state, now_ms))
+
+        state_counts[new_state] = state_counts.get(new_state, 0) + 1
+
+    # Exactly one transaction for the candidate hot path: one batched state
+    # upsert + one batched history insert + one commit.
+    if pending_states or pending_history:
+        db = db_connect()
+        try:
+            db.execute("BEGIN")
+            _batch_upsert_candidate_states(pending_states)
+            _batch_insert_candidate_history(pending_history)
+            db.commit()
+        except Exception:
+            db_rollback()
+            raise
 
     snapshot_targets = [
         row[0] for row in db_query(
@@ -728,8 +815,8 @@ def discover_and_score():
         )
     ]
 
+    log.info("TIMING candidate scoring + DB: %.2fs", time.perf_counter() - t0)
     return snapshot_targets, predict_targets, valid, state_counts, btc_context
-
 
 def cleanup_old_data():
     """The main sources of unbounded growth: hourly snapshots, resolved
@@ -1288,86 +1375,48 @@ def previous_snapshot(symbol, before_ms=None):
     return rows[0] if rows else None
 
 
+def build_snapshot_row(symbol, btc_context, price, depth, bucket_ms, previous_oi=None):
+    """Build a snapshot row without touching Turso.
+
+    Existence and previous-OI checks are batched by the caller. Funding/OI
+    are local reads from the cached Kraken Futures ticker list.
+    """
+    if price is None or depth is None:
+        raise ValueError(f"Missing price/depth for {symbol}")
+
+    obi, spread_bps, book_age_sec = orderbook_features(depth)
+    funding = get_funding(symbol)
+    open_interest = get_open_interest(symbol)
+
+    previous_oi = float(previous_oi or 0.0)
+    oi_change = ((open_interest - previous_oi) / abs(previous_oi)) if previous_oi else 0.0
+    btc_ret24, btc_vol24, btc_ema_spread = btc_context
+
+    return (
+        symbol, bucket_ms, price,
+        obi[5], obi[10], obi[20], obi[50], obi[100],
+        spread_bps, book_age_sec, funding,
+        open_interest, oi_change,
+        btc_ret24, btc_vol24, btc_ema_spread
+    )
+
+
 def collect_snapshot(symbol, btc_context, price=None, depth=None):
+    """Compatibility wrapper for non-hot-path callers."""
     now_ms = int(time.time() * 1000)
-
-    # One observation per UTC hour.
-    bucket_ms = (
-        now_ms // 3_600_000
-    ) * 3_600_000
-
-    exists = db_query("""
-        SELECT id
-        FROM market_snapshots_v401
-        WHERE symbol=? AND snapshot_ms=?
-    """, (symbol, bucket_ms))
-
+    bucket_ms = (now_ms // 3_600_000) * 3_600_000
+    exists = db_query("SELECT id FROM market_snapshots_v401 WHERE symbol=? AND snapshot_ms=?", (symbol, bucket_ms))
     if exists:
         return
-
-    try:
-        if price is None:
-            price = get_price(symbol)
-
-        if depth is None:
-            depth = get_depth(symbol, 100)
-        obi, spread_bps, book_age_sec = orderbook_features(depth)
-
-        funding = get_funding(symbol)
-        open_interest = get_open_interest(symbol)
-
-        previous = previous_snapshot(symbol)
-
-        previous_oi = (
-            float(previous[1])
-            if previous and previous[1] is not None
-            else 0.0
-        )
-
-        if previous_oi:
-            oi_change = (
-                (open_interest - previous_oi) /
-                abs(previous_oi)
-            )
-        else:
-            oi_change = 0.0
-
-        btc_ret24, btc_vol24, btc_ema_spread = btc_context
-
-        db_execute("""
+    previous = previous_snapshot(symbol)
+    row = build_snapshot_row(symbol, btc_context, price, depth, bucket_ms, previous[1] if previous else None)
+    db_execute("""
         INSERT OR IGNORE INTO market_snapshots_v401 (
-            symbol, snapshot_ms, price,
-            obi5, obi10, obi20, obi50, obi100,
-            spread_bps, book_age_sec, funding,
-            open_interest, oi_change,
+            symbol, snapshot_ms, price, obi5, obi10, obi20, obi50, obi100,
+            spread_bps, book_age_sec, funding, open_interest, oi_change,
             btc_ret24, btc_vol24, btc_ema_spread
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            symbol,
-            bucket_ms,
-            price,
-
-            obi[5],
-            obi[10],
-            obi[20],
-            obi[50],
-            obi[100],
-
-            spread_bps,
-            book_age_sec,
-            funding,
-
-            open_interest,
-            oi_change,
-
-            btc_ret24,
-            btc_vol24,
-            btc_ema_spread
-        ))
-
-    except Exception as exc:
-        log.warning("Snapshot failed for %s: %s", symbol, exc)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, row)
 
 
 def build_micro_sequence(symbol, length, as_of_ms):
@@ -2722,166 +2771,49 @@ def latest_source_time(
 
 
 def prediction_exists(symbol, strategy, source_close_ms):
-    rows = db_query("""
-        SELECT
-            MAX(CASE WHEN source_close_ms=? THEN 1 ELSE 0 END),
-            MAX(CASE WHEN train_candidate=1 THEN 1 ELSE 0 END)
-        FROM predictions_v401
-        WHERE symbol=?
-          AND strategy=?
-          AND source_close_ms BETWEEN ? AND ?
-    """, (
-        int(source_close_ms),
-        symbol,
-        strategy,
-        int(source_close_ms) - ((6 if strategy == "day" else 12) * 3600 * 1000) + 1,
-        int(source_close_ms) + ((6 if strategy == "day" else 12) * 3600 * 1000) - 1
-    ))
+    rows=db_query("SELECT id FROM predictions_v401 WHERE symbol=? AND strategy=? AND source_close_ms=? LIMIT 1",(symbol,strategy,int(source_close_ms)))
+    return bool(rows)
 
-    if not rows:
-        return False, False
-
-    return bool(rows[0][0]), bool(rows[0][1])
-
-
-def predict_signal(
-    symbol,
-    strategy,
-    exchange_info,
-    btc_context,
-    checkpoint_bundle,
-    prediction_batch
-):
-    sample = build_sample(
-        symbol,
-        strategy,
-        btc_context=btc_context
-    )
-
-    if sample is None:
+def predict_signal(symbol, strategy, exchange_info, btc_context):
+    sample=build_sample(symbol,strategy,btc_context=btc_context)
+    if sample is None or prediction_exists(symbol,strategy,sample["source_close"]):
         return None
-
-    source_close_ms = int(sample["source_close"])
-
-    # Merge the old exact-duplicate check and wider train-candidate
-    # dedup check into one Turso round-trip.
-    exact_exists, nearby_train_candidate = prediction_exists(
-        symbol,
-        strategy,
-        source_close_ms
-    )
-
-    if exact_exists:
-        return None
-
-    cfg = STRATEGIES[strategy]
-    decision_entry = float(sample["entry"])
-    atr = float(sample["atr"])
-    target = decision_entry + cfg["target_atr"] * atr
-    stop = decision_entry - cfg["stop_atr"] * atr
-
-    # Checkpoint is loaded once per strategy per run by main().
-    model, temperature, threshold, checkpoint = checkpoint_bundle
-    now_ms = int(time.time() * 1000)
-
+    cfg=STRATEGIES[strategy]; decision_entry=float(sample["entry"]); atr=float(sample["atr"])
+    target=decision_entry+cfg["target_atr"]*atr; stop=decision_entry-cfg["stop_atr"]*atr
+    model,temperature,threshold,checkpoint=load_checkpoint(strategy)
+    now_ms=int(time.time()*1000)
     # Bootstrap-safe: insert the clean causal observation even when no model exists.
-    predicted_prob = calibrated_prob = predicted_hours = None
-    should_signal = False
-    expected_value = 0.0
-    quantity = 0.0
-
+    predicted_prob=calibrated_prob=predicted_hours=None; should_signal=False; expected_value=0.0; quantity=0.0
     if model is not None:
-        tensors = [torch.tensor(sample[k][None], dtype=torch.float32) for k in ("seqs", "micro", "static")] if False else None
-
+        tensors=[torch.tensor(sample[k][None],dtype=torch.float32) for k in ("seqs","micro","static")] if False else None
         with torch.no_grad():
-            logits, time_output = model(
-                torch.tensor(sample["seqs"]["1h"][None], dtype=torch.float32),
-                torch.tensor(sample["seqs"]["4h"][None], dtype=torch.float32),
-                torch.tensor(sample["seqs"]["1d"][None], dtype=torch.float32),
-                torch.tensor(sample["micro"][None], dtype=torch.float32),
-                torch.tensor(sample["static"][None], dtype=torch.float32)
-            )
-
-        predicted_prob = float(torch.sigmoid(logits).item())
-        calibrated_prob = float(torch.sigmoid(logits / max(temperature, 0.05)).item())
-        predicted_hours = max(1.0, math.expm1(float(time_output.item())))
-
-        rr = cfg["target_atr"] / cfg["stop_atr"]
-        expected_value = calibrated_prob * rr - (1 - calibrated_prob) - 0.03
-
-        should_signal = (
-            calibrated_prob >= threshold and
-            expected_value >= MIN_EV and
-            open_signal_count(symbol) == 0
-        )
-
-        total, major, alt = current_exposure()
-
-        if total >= MAX_TOTAL_EXPOSURE or (symbol in MAJORS and major >= MAX_MAJOR_EXPOSURE) or (symbol not in MAJORS and alt >= MAX_ALT_EXPOSURE):
-            should_signal = False
-
+            logits,time_output=model(torch.tensor(sample["seqs"]["1h"][None],dtype=torch.float32),torch.tensor(sample["seqs"]["4h"][None],dtype=torch.float32),torch.tensor(sample["seqs"]["1d"][None],dtype=torch.float32),torch.tensor(sample["micro"][None],dtype=torch.float32),torch.tensor(sample["static"][None],dtype=torch.float32))
+        predicted_prob=float(torch.sigmoid(logits).item())
+        calibrated_prob=float(torch.sigmoid(logits/max(temperature,0.05)).item())
+        predicted_hours=max(1.0,math.expm1(float(time_output.item())))
+        rr=cfg["target_atr"]/cfg["stop_atr"]
+        expected_value=calibrated_prob*rr-(1-calibrated_prob)-0.03
+        should_signal=(calibrated_prob>=threshold and expected_value>=MIN_EV and open_signal_count(symbol)==0)
+        total,major,alt=current_exposure()
+        if total>=MAX_TOTAL_EXPOSURE or (symbol in MAJORS and major>=MAX_MAJOR_EXPOSURE) or (symbol not in MAJORS and alt>=MAX_ALT_EXPOSURE): should_signal=False
         if should_signal:
             # Actionable entry is LIVE price, fetched only after model/risk gates.
-            live_entry = get_price(symbol)
-            live_target = live_entry + cfg["target_atr"] * atr
-            live_stop = live_entry - cfg["stop_atr"] * atr
-            quantity = position_size(symbol, live_entry, live_stop, exchange_info, calibrated_prob)
-
-            if quantity <= 0:
-                should_signal = False
+            live_entry=get_price(symbol)
+            live_target=live_entry+cfg["target_atr"]*atr
+            live_stop=live_entry-cfg["stop_atr"]*atr
+            quantity=position_size(symbol,live_entry,live_stop,exchange_info,calibrated_prob)
+            if quantity<=0: should_signal=False
         else:
-            live_entry = live_target = live_stop = None
-
+            live_entry=live_target=live_stop=None
     else:
-        live_entry = live_target = live_stop = None
-        log.info("%s/%s: no checkpoint; recording bootstrap observation", symbol, strategy)
-
-    # The wider-window result was already fetched above. It contains the
-    # exact source_close point as a special case, so no second Turso query
-    # is needed for train_candidate.
-    train_candidate = 0 if nearby_train_candidate else 1
-
-    prediction_batch.append((
-        symbol,
-        strategy,
-        now_ms,
-        source_close_ms,
-        decision_entry,
-        target,
-        stop,
-        live_entry,
-        live_target,
-        live_stop,
-        atr,
-        predicted_prob,
-        calibrated_prob,
-        predicted_hours,
-        threshold if model is not None else None,
-        int(should_signal),
-        0,
-        train_candidate,
-        VERSION,
-        serialize_sample(sample),
-        json.dumps(sample["static"].tolist(), separators=(",", ":")),
-        now_ms
-    ))
-
-    if not should_signal:
-        return None
-
-    return {
-        "symbol": symbol,
-        "strategy": strategy,
-        "entry": live_entry,
-        "target": live_target,
-        "stop": live_stop,
-        "probability": calibrated_prob,
-        "hours": predicted_hours,
-        "quantity": quantity,
-        "expected_value": expected_value,
-        "decision_entry": decision_entry,
-        "source_close": source_close_ms
-    }
+        live_entry=live_target=live_stop=None
+        log.info("%s/%s: no checkpoint; recording bootstrap observation",symbol,strategy)
+    stride_ms=(6 if strategy=="day" else 12)*3600*1000
+    nearby=db_query("SELECT id FROM predictions_v401 WHERE symbol=? AND strategy=? AND train_candidate=1 AND source_close_ms BETWEEN ? AND ? LIMIT 1",(symbol,strategy,sample["source_close"]-stride_ms+1,sample["source_close"]+stride_ms-1))
+    train_candidate=0 if nearby else 1
+    db_execute("""INSERT INTO predictions_v401 (symbol,strategy,predicted_at,source_close_ms,decision_entry_price,target_price,stop_price,live_entry_price,live_target_price,live_stop_price,atr,predicted_prob,calibrated_prob,predicted_hours,threshold,signaled,resolved,train_candidate,model_version,sequence_json,static_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(symbol,strategy,now_ms,sample["source_close"],decision_entry,target,stop,live_entry,live_target,live_stop,atr,predicted_prob,calibrated_prob,predicted_hours,threshold if model is not None else None,int(should_signal),0,train_candidate,VERSION,serialize_sample(sample),json.dumps(sample["static"].tolist(),separators=(",",":")),now_ms))
+    if not should_signal: return None
+    return {"symbol":symbol,"strategy":strategy,"entry":live_entry,"target":live_target,"stop":live_stop,"probability":calibrated_prob,"hours":predicted_hours,"quantity":quantity,"expected_value":expected_value,"decision_entry":decision_entry,"source_close":sample["source_close"]}
 
 
 # ============================================================
@@ -3291,22 +3223,72 @@ def main():
     price_cache = parallel_fetch(snapshot_targets, get_price)
     depth_cache = parallel_fetch(snapshot_targets, lambda s: get_depth(s, 100))
 
+    snapshot_t0 = time.perf_counter()
+    bucket_ms = (int(time.time() * 1000) // 3_600_000) * 3_600_000
+    if snapshot_targets:
+        placeholders = ",".join("?" for _ in snapshot_targets)
+        existing_rows = db_query(
+            f"SELECT symbol FROM market_snapshots_v401 WHERE snapshot_ms=? AND symbol IN ({placeholders})",
+            (bucket_ms, *snapshot_targets)
+        )
+        existing_symbols = {row[0] for row in existing_rows}
+
+        previous_rows = db_query(
+            f"""
+            SELECT m.symbol, m.open_interest
+            FROM market_snapshots_v401 m
+            JOIN (
+                SELECT symbol, MAX(snapshot_ms) AS snapshot_ms
+                FROM market_snapshots_v401
+                WHERE snapshot_ms < ? AND symbol IN ({placeholders})
+                GROUP BY symbol
+            ) p ON p.symbol=m.symbol AND p.snapshot_ms=m.snapshot_ms
+            """,
+            (bucket_ms, *snapshot_targets)
+        )
+        previous_oi = {row[0]: row[1] for row in previous_rows}
+    else:
+        existing_symbols = set()
+        previous_oi = {}
+
+    pending_snapshots = []
     for symbol in snapshot_targets:
+        if symbol in existing_symbols:
+            snapshot_ok += 1
+            continue
         try:
-            collect_snapshot(
+            row = build_snapshot_row(
                 symbol,
                 btc_context,
-                price=price_cache.get(symbol),
-                depth=depth_cache.get(symbol)
+                price_cache.get(symbol),
+                depth_cache.get(symbol),
+                bucket_ms,
+                previous_oi.get(symbol)
             )
+            pending_snapshots.append(row)
             snapshot_ok += 1
         except Exception as exc:
-            log.warning(
-                "Snapshot loop failed for %s: %s",
-                symbol,
-                exc
-            )
+            log.warning("Snapshot loop failed for %s: %s", symbol, exc)
             snapshot_failed.append(symbol)
+
+    if pending_snapshots:
+        db = db_connect()
+        try:
+            db.execute("BEGIN")
+            sql = """
+                INSERT OR IGNORE INTO market_snapshots_v401 (
+                    symbol, snapshot_ms, price, obi5, obi10, obi20, obi50, obi100,
+                    spread_bps, book_age_sec, funding, open_interest, oi_change,
+                    btc_ret24, btc_vol24, btc_ema_spread
+                ) VALUES """ + ",".join("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" for _ in pending_snapshots)
+            params = tuple(v for row in pending_snapshots for v in row)
+            db_execute_no_commit(sql, params)
+            db.commit()
+        except Exception:
+            db_rollback()
+            raise
+
+    log.info("TIMING snapshot DB writes: %.2fs", time.perf_counter() - snapshot_t0)
 
     telegram_send(
         format_data_collection(snapshot_ok, len(snapshot_failed), snapshot_failed, len(snapshot_targets))
@@ -3356,13 +3338,6 @@ def main():
         errors.append(("training", exc))
 
     signals = []
-    prediction_batch = []
-
-    # Load each strategy checkpoint exactly once per run.
-    checkpoint_cache = {
-        strategy: load_checkpoint(strategy)
-        for strategy in STRATEGIES
-    }
 
     # Pre-warms 1h/4h/1d candles for every prediction target, concurrently,
     # before the sequential loop below — so every predict_signal() call
@@ -3376,14 +3351,18 @@ def main():
                     symbol,
                     strategy,
                     exchange_info,
-                    btc_context,
-                    checkpoint_cache[strategy],
-                    prediction_batch
+                    btc_context
                 )
 
                 if signal:
                     signals.append(
                         signal
+                    )
+
+                    telegram_send(
+                        format_signal(
+                            signal
+                        )
                     )
 
             except Exception as exc:
@@ -3394,49 +3373,6 @@ def main():
                     exc
                 )
                 errors.append((f"predict/{symbol}/{strategy}", exc))
-
-    # Preserve all prediction/observation rows exactly; only the DB write
-    # boundary changes to one batch INSERT and one COMMIT for this pass.
-    if prediction_batch:
-        db_executemany(
-            """
-            INSERT INTO predictions_v401 (
-                symbol,
-                strategy,
-                predicted_at,
-                source_close_ms,
-                decision_entry_price,
-                target_price,
-                stop_price,
-                live_entry_price,
-                live_target_price,
-                live_stop_price,
-                atr,
-                predicted_prob,
-                calibrated_prob,
-                predicted_hours,
-                threshold,
-                signaled,
-                resolved,
-                train_candidate,
-                model_version,
-                sequence_json,
-                static_json,
-                created_at
-            )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            prediction_batch
-        )
-
-    # Send signal notifications only after the prediction batch has been
-    # durably written, preserving the old ordering (DB write before alert).
-    for signal in signals:
-        telegram_send(
-            format_signal(
-                signal
-            )
-        )
 
     # One aggregated error alert instead of one per failure, to avoid
     # spamming — but every failure still gets logged individually above.
