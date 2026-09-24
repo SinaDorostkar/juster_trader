@@ -910,10 +910,15 @@ def cleanup_old_data():
         to_delete = [row[0] for row in trainable_old if row[0] not in keep_ids]
         to_delete += [row[0] for row in non_trainable_old]
 
-        for i in range(0, len(to_delete), 500):
-            chunk = to_delete[i:i + 500]
-            placeholders = ",".join("?" for _ in chunk)
-            db_execute(f"DELETE FROM predictions_v401 WHERE id IN ({placeholders})", tuple(chunk))
+        # Keep the existing deletion semantics, but collapse all eligible
+        # IDs for this strategy into one DELETE/commit instead of issuing a
+        # separate Turso round-trip for every 500-row chunk.
+        if to_delete:
+            placeholders = ",".join("?" for _ in to_delete)
+            db_execute(
+                f"DELETE FROM predictions_v401 WHERE id IN ({placeholders})",
+                tuple(to_delete)
+            )
 
         pruned_predictions += len(to_delete)
 
@@ -956,19 +961,39 @@ def cleanup_old_data():
         (dormant_cutoff,)
     )
 
-    for (symbol,) in long_dormant:
-        # Fully forgotten — if it ever recovers, it re-enters as a new
-        # Scout from scratch, same as any coin we've never seen before.
-        db_execute("DELETE FROM market_snapshots_v401 WHERE symbol=?", (symbol,))
-        db_execute("DELETE FROM candidate_state_v401 WHERE symbol=?", (symbol,))
+    # Fully forgotten — if it ever recovers, it re-enters as a new
+    # Scout from scratch, same as any coin we've never seen before.
+    # Batch both tables so dormant cleanup does not incur two commits per
+    # symbol over the remote Turso connection.
+    dormant_symbols = [symbol for (symbol,) in long_dormant]
+    if dormant_symbols:
+        placeholders = ",".join("?" for _ in dormant_symbols)
+        db_execute(
+            f"DELETE FROM market_snapshots_v401 WHERE symbol IN ({placeholders})",
+            tuple(dormant_symbols)
+        )
+        db_execute(
+            f"DELETE FROM candidate_state_v401 WHERE symbol IN ({placeholders})",
+            tuple(dormant_symbols)
+        )
 
     # Delisted symbols: no longer a valid Kraken pair at all.
     valid = kraken_pairs()
     tracked = db_query("SELECT symbol FROM candidate_state_v401")
-    for (symbol,) in tracked:
-        if symbol not in valid and symbol not in STATIC_WATCHLIST:
-            db_execute("DELETE FROM market_snapshots_v401 WHERE symbol=?", (symbol,))
-            db_execute("DELETE FROM candidate_state_v401 WHERE symbol=?", (symbol,))
+    delisted_symbols = [
+        symbol for (symbol,) in tracked
+        if symbol not in valid and symbol not in STATIC_WATCHLIST
+    ]
+    if delisted_symbols:
+        placeholders = ",".join("?" for _ in delisted_symbols)
+        db_execute(
+            f"DELETE FROM market_snapshots_v401 WHERE symbol IN ({placeholders})",
+            tuple(delisted_symbols)
+        )
+        db_execute(
+            f"DELETE FROM candidate_state_v401 WHERE symbol IN ({placeholders})",
+            tuple(delisted_symbols)
+        )
 
     log.info(
         "Cleanup: pruned %d resolved predictions, abandoned %d stuck-unresolved, "
