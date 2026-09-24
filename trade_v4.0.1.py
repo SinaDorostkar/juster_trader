@@ -276,6 +276,25 @@ def db_query(sql, params=()):
     return cur.fetchall()
 
 
+def db_executemany(sql, rows):
+    """Execute a batch of writes and commit once."""
+    rows = list(rows)
+    if not rows:
+        return None
+
+    db = db_connect()
+    cur = db.cursor()
+    cur.executemany(sql, rows)
+
+    try:
+        db.commit()
+    except Exception as exc:
+        log.error("DB batch commit failed for statement %r: %s", sql[:120], exc)
+        raise
+
+    return cur
+
+
 def db_commit():
     db_connect().commit()
 
@@ -2771,49 +2790,166 @@ def latest_source_time(
 
 
 def prediction_exists(symbol, strategy, source_close_ms):
-    rows=db_query("SELECT id FROM predictions_v401 WHERE symbol=? AND strategy=? AND source_close_ms=? LIMIT 1",(symbol,strategy,int(source_close_ms)))
-    return bool(rows)
+    rows = db_query("""
+        SELECT
+            MAX(CASE WHEN source_close_ms=? THEN 1 ELSE 0 END),
+            MAX(CASE WHEN train_candidate=1 THEN 1 ELSE 0 END)
+        FROM predictions_v401
+        WHERE symbol=?
+          AND strategy=?
+          AND source_close_ms BETWEEN ? AND ?
+    """, (
+        int(source_close_ms),
+        symbol,
+        strategy,
+        int(source_close_ms) - ((6 if strategy == "day" else 12) * 3600 * 1000) + 1,
+        int(source_close_ms) + ((6 if strategy == "day" else 12) * 3600 * 1000) - 1
+    ))
 
-def predict_signal(symbol, strategy, exchange_info, btc_context):
-    sample=build_sample(symbol,strategy,btc_context=btc_context)
-    if sample is None or prediction_exists(symbol,strategy,sample["source_close"]):
+    if not rows:
+        return False, False
+
+    return bool(rows[0][0]), bool(rows[0][1])
+
+
+def predict_signal(
+    symbol,
+    strategy,
+    exchange_info,
+    btc_context,
+    checkpoint_bundle,
+    prediction_batch
+):
+    sample = build_sample(
+        symbol,
+        strategy,
+        btc_context=btc_context
+    )
+
+    if sample is None:
         return None
-    cfg=STRATEGIES[strategy]; decision_entry=float(sample["entry"]); atr=float(sample["atr"])
-    target=decision_entry+cfg["target_atr"]*atr; stop=decision_entry-cfg["stop_atr"]*atr
-    model,temperature,threshold,checkpoint=load_checkpoint(strategy)
-    now_ms=int(time.time()*1000)
+
+    source_close_ms = int(sample["source_close"])
+
+    # Merge the old exact-duplicate check and wider train-candidate
+    # dedup check into one Turso round-trip.
+    exact_exists, nearby_train_candidate = prediction_exists(
+        symbol,
+        strategy,
+        source_close_ms
+    )
+
+    if exact_exists:
+        return None
+
+    cfg = STRATEGIES[strategy]
+    decision_entry = float(sample["entry"])
+    atr = float(sample["atr"])
+    target = decision_entry + cfg["target_atr"] * atr
+    stop = decision_entry - cfg["stop_atr"] * atr
+
+    # Checkpoint is loaded once per strategy per run by main().
+    model, temperature, threshold, checkpoint = checkpoint_bundle
+    now_ms = int(time.time() * 1000)
+
     # Bootstrap-safe: insert the clean causal observation even when no model exists.
-    predicted_prob=calibrated_prob=predicted_hours=None; should_signal=False; expected_value=0.0; quantity=0.0
+    predicted_prob = calibrated_prob = predicted_hours = None
+    should_signal = False
+    expected_value = 0.0
+    quantity = 0.0
+
     if model is not None:
-        tensors=[torch.tensor(sample[k][None],dtype=torch.float32) for k in ("seqs","micro","static")] if False else None
+        tensors = [torch.tensor(sample[k][None], dtype=torch.float32) for k in ("seqs", "micro", "static")] if False else None
+
         with torch.no_grad():
-            logits,time_output=model(torch.tensor(sample["seqs"]["1h"][None],dtype=torch.float32),torch.tensor(sample["seqs"]["4h"][None],dtype=torch.float32),torch.tensor(sample["seqs"]["1d"][None],dtype=torch.float32),torch.tensor(sample["micro"][None],dtype=torch.float32),torch.tensor(sample["static"][None],dtype=torch.float32))
-        predicted_prob=float(torch.sigmoid(logits).item())
-        calibrated_prob=float(torch.sigmoid(logits/max(temperature,0.05)).item())
-        predicted_hours=max(1.0,math.expm1(float(time_output.item())))
-        rr=cfg["target_atr"]/cfg["stop_atr"]
-        expected_value=calibrated_prob*rr-(1-calibrated_prob)-0.03
-        should_signal=(calibrated_prob>=threshold and expected_value>=MIN_EV and open_signal_count(symbol)==0)
-        total,major,alt=current_exposure()
-        if total>=MAX_TOTAL_EXPOSURE or (symbol in MAJORS and major>=MAX_MAJOR_EXPOSURE) or (symbol not in MAJORS and alt>=MAX_ALT_EXPOSURE): should_signal=False
+            logits, time_output = model(
+                torch.tensor(sample["seqs"]["1h"][None], dtype=torch.float32),
+                torch.tensor(sample["seqs"]["4h"][None], dtype=torch.float32),
+                torch.tensor(sample["seqs"]["1d"][None], dtype=torch.float32),
+                torch.tensor(sample["micro"][None], dtype=torch.float32),
+                torch.tensor(sample["static"][None], dtype=torch.float32)
+            )
+
+        predicted_prob = float(torch.sigmoid(logits).item())
+        calibrated_prob = float(torch.sigmoid(logits / max(temperature, 0.05)).item())
+        predicted_hours = max(1.0, math.expm1(float(time_output.item())))
+
+        rr = cfg["target_atr"] / cfg["stop_atr"]
+        expected_value = calibrated_prob * rr - (1 - calibrated_prob) - 0.03
+
+        should_signal = (
+            calibrated_prob >= threshold and
+            expected_value >= MIN_EV and
+            open_signal_count(symbol) == 0
+        )
+
+        total, major, alt = current_exposure()
+
+        if total >= MAX_TOTAL_EXPOSURE or (symbol in MAJORS and major >= MAX_MAJOR_EXPOSURE) or (symbol not in MAJORS and alt >= MAX_ALT_EXPOSURE):
+            should_signal = False
+
         if should_signal:
             # Actionable entry is LIVE price, fetched only after model/risk gates.
-            live_entry=get_price(symbol)
-            live_target=live_entry+cfg["target_atr"]*atr
-            live_stop=live_entry-cfg["stop_atr"]*atr
-            quantity=position_size(symbol,live_entry,live_stop,exchange_info,calibrated_prob)
-            if quantity<=0: should_signal=False
+            live_entry = get_price(symbol)
+            live_target = live_entry + cfg["target_atr"] * atr
+            live_stop = live_entry - cfg["stop_atr"] * atr
+            quantity = position_size(symbol, live_entry, live_stop, exchange_info, calibrated_prob)
+
+            if quantity <= 0:
+                should_signal = False
         else:
-            live_entry=live_target=live_stop=None
+            live_entry = live_target = live_stop = None
+
     else:
-        live_entry=live_target=live_stop=None
-        log.info("%s/%s: no checkpoint; recording bootstrap observation",symbol,strategy)
-    stride_ms=(6 if strategy=="day" else 12)*3600*1000
-    nearby=db_query("SELECT id FROM predictions_v401 WHERE symbol=? AND strategy=? AND train_candidate=1 AND source_close_ms BETWEEN ? AND ? LIMIT 1",(symbol,strategy,sample["source_close"]-stride_ms+1,sample["source_close"]+stride_ms-1))
-    train_candidate=0 if nearby else 1
-    db_execute("""INSERT INTO predictions_v401 (symbol,strategy,predicted_at,source_close_ms,decision_entry_price,target_price,stop_price,live_entry_price,live_target_price,live_stop_price,atr,predicted_prob,calibrated_prob,predicted_hours,threshold,signaled,resolved,train_candidate,model_version,sequence_json,static_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(symbol,strategy,now_ms,sample["source_close"],decision_entry,target,stop,live_entry,live_target,live_stop,atr,predicted_prob,calibrated_prob,predicted_hours,threshold if model is not None else None,int(should_signal),0,train_candidate,VERSION,serialize_sample(sample),json.dumps(sample["static"].tolist(),separators=(",",":")),now_ms))
-    if not should_signal: return None
-    return {"symbol":symbol,"strategy":strategy,"entry":live_entry,"target":live_target,"stop":live_stop,"probability":calibrated_prob,"hours":predicted_hours,"quantity":quantity,"expected_value":expected_value,"decision_entry":decision_entry,"source_close":sample["source_close"]}
+        live_entry = live_target = live_stop = None
+        log.info("%s/%s: no checkpoint; recording bootstrap observation", symbol, strategy)
+
+    # The wider-window result was already fetched above. It contains the
+    # exact source_close point as a special case, so no second Turso query
+    # is needed for train_candidate.
+    train_candidate = 0 if nearby_train_candidate else 1
+
+    prediction_batch.append((
+        symbol,
+        strategy,
+        now_ms,
+        source_close_ms,
+        decision_entry,
+        target,
+        stop,
+        live_entry,
+        live_target,
+        live_stop,
+        atr,
+        predicted_prob,
+        calibrated_prob,
+        predicted_hours,
+        threshold if model is not None else None,
+        int(should_signal),
+        0,
+        train_candidate,
+        VERSION,
+        serialize_sample(sample),
+        json.dumps(sample["static"].tolist(), separators=(",", ":")),
+        now_ms
+    ))
+
+    if not should_signal:
+        return None
+
+    return {
+        "symbol": symbol,
+        "strategy": strategy,
+        "entry": live_entry,
+        "target": live_target,
+        "stop": live_stop,
+        "probability": calibrated_prob,
+        "hours": predicted_hours,
+        "quantity": quantity,
+        "expected_value": expected_value,
+        "decision_entry": decision_entry,
+        "source_close": source_close_ms
+    }
 
 
 # ============================================================
@@ -3338,6 +3474,13 @@ def main():
         errors.append(("training", exc))
 
     signals = []
+    prediction_batch = []
+
+    # Load each strategy checkpoint exactly once per run.
+    checkpoint_cache = {
+        strategy: load_checkpoint(strategy)
+        for strategy in STRATEGIES
+    }
 
     # Pre-warms 1h/4h/1d candles for every prediction target, concurrently,
     # before the sequential loop below — so every predict_signal() call
@@ -3351,18 +3494,14 @@ def main():
                     symbol,
                     strategy,
                     exchange_info,
-                    btc_context
+                    btc_context,
+                    checkpoint_cache[strategy],
+                    prediction_batch
                 )
 
                 if signal:
                     signals.append(
                         signal
-                    )
-
-                    telegram_send(
-                        format_signal(
-                            signal
-                        )
                     )
 
             except Exception as exc:
@@ -3373,6 +3512,49 @@ def main():
                     exc
                 )
                 errors.append((f"predict/{symbol}/{strategy}", exc))
+
+    # Preserve all prediction/observation rows exactly; only the DB write
+    # boundary changes to one batch INSERT and one COMMIT for this pass.
+    if prediction_batch:
+        db_executemany(
+            """
+            INSERT INTO predictions_v401 (
+                symbol,
+                strategy,
+                predicted_at,
+                source_close_ms,
+                decision_entry_price,
+                target_price,
+                stop_price,
+                live_entry_price,
+                live_target_price,
+                live_stop_price,
+                atr,
+                predicted_prob,
+                calibrated_prob,
+                predicted_hours,
+                threshold,
+                signaled,
+                resolved,
+                train_candidate,
+                model_version,
+                sequence_json,
+                static_json,
+                created_at
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            prediction_batch
+        )
+
+    # Send signal notifications only after the prediction batch has been
+    # durably written, preserving the old ordering (DB write before alert).
+    for signal in signals:
+        telegram_send(
+            format_signal(
+                signal
+            )
+        )
 
     # One aggregated error alert instead of one per failure, to avoid
     # spamming — but every failure still gets logged individually above.
