@@ -247,63 +247,247 @@ def db_connect():
     return _db
 
 
-def db_execute(sql, params=()):
-    """Run one write and commit it. Kept for isolated writes outside hot paths."""
-    db = db_connect()
-    cur = db.cursor()
-    cur.execute(sql, params)
+# ------------------------------------------------------------
+# Turso retry layer
+# ------------------------------------------------------------
+# Every DB helper below runs through _run_with_retry. On ANY failure the
+# open transaction is rolled back first (so a failed statement can never
+# leave the shared connection dirty for the next caller). Transient
+# failures then drop the connection, back off with jitter, and retry.
+#
+# Replay safety is the caller's declared property (`idempotent`):
+#   * idempotent=True  -> the whole unit may be replayed, including after
+#     an ambiguous COMMIT (upserts, INSERT ... DO NOTHING, UPDATE to a
+#     fixed value, DELETE by key, reads).
+#   * idempotent=False -> replayed only if the failure happened BEFORE the
+#     COMMIT was sent. If the COMMIT itself fails transiently the write may
+#     or may not have landed, so AmbiguousCommitError is raised instead of
+#     blindly replaying it.
+DB_MAX_ATTEMPTS = int(os.getenv("DB_MAX_ATTEMPTS", "4"))
+DB_RETRY_BASE_SEC = float(os.getenv("DB_RETRY_BASE_SEC", "0.5"))
+
+# Checked FIRST: a constraint/syntax error is never worth retrying, even if
+# its message happens to contain a transient-looking word.
+_PERMANENT_DB_MARKERS = (
+    "constraint", "unique", "not null", "syntax error", "no such table",
+    "no such column", "datatype mismatch", "unauthorized", "authentication",
+)
+_TRANSIENT_DB_MARKERS = (
+    "timeout", "timed out", "connection", "reset by peer", "broken pipe",
+    "temporarily", "unavailable", "bad gateway", "gateway", "502", "503",
+    "504", "429", "too many requests", "stream", "baton", "eof",
+    "network", "ssl", "closed", "database is locked", "busy",
+)
+
+
+class AmbiguousCommitError(RuntimeError):
+    """A non-idempotent write failed transiently after its COMMIT was
+    sent, so it may or may not have been applied. Never replayed blindly."""
+
+
+def _is_transient(exc):
+    msg = str(exc).lower()
+    if any(m in msg for m in _PERMANENT_DB_MARKERS):
+        return False
+    if isinstance(exc, (ConnectionError, TimeoutError, requests.exceptions.RequestException)):
+        return True
+    return any(m in msg for m in _TRANSIENT_DB_MARKERS)
+
+
+def _reset_connection():
+    global _db
+    old, _db = _db, None
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+
+
+def db_rollback():
+    # Never opens a NEW connection just to roll it back.
+    if _db is None:
+        return
     try:
+        _db.rollback()
+    except Exception:
+        pass
+
+
+def _run_with_retry(what, attempt_fn, idempotent=True):
+    for attempt in range(1, DB_MAX_ATTEMPTS + 1):
+        stage = {"commit_sent": False}
+        try:
+            return attempt_fn(stage)
+        except Exception as exc:
+            db_rollback()
+
+            if not _is_transient(exc):
+                log.error("DB %s failed (not retryable): %s", what, exc)
+                raise
+
+            if stage["commit_sent"] and not idempotent:
+                _reset_connection()
+                log.error("DB %s: commit outcome unknown after %s: %s", what, type(exc).__name__, exc)
+                raise AmbiguousCommitError(
+                    f"{what}: commit outcome unknown ({type(exc).__name__}: {exc})"
+                ) from exc
+
+            if attempt == DB_MAX_ATTEMPTS:
+                log.error("DB %s failed after %d attempts: %s", what, attempt, exc)
+                raise
+
+            _reset_connection()
+            delay = DB_RETRY_BASE_SEC * (2 ** (attempt - 1)) * (0.5 + random.random())
+            log.warning(
+                "DB %s transient failure (attempt %d/%d): %s | retrying in %.1fs",
+                what, attempt, DB_MAX_ATTEMPTS, exc, delay
+            )
+            time.sleep(delay)
+
+
+def db_execute(sql, params=(), idempotent=True):
+    """Run one write and commit it. Kept for isolated writes outside hot paths."""
+    def _do(stage):
+        db = db_connect()
+        cur = db.cursor()
+        cur.execute(sql, params)
+        stage["commit_sent"] = True
         db.commit()
-    except Exception as exc:
-        log.error("DB commit failed for statement %r: %s", sql[:120], exc)
-        raise
-    return cur
+        return cur
 
-
-def db_execute_no_commit(sql, params=()):
-    """Run a write without committing; caller owns the transaction."""
-    db = db_connect()
-    cur = db.cursor()
-    cur.execute(sql, params)
-    return cur
+    return _run_with_retry(f"write {sql.strip()[:60]!r}", _do, idempotent)
 
 
 def db_query(sql, params=()):
-    """Run a SELECT. Reads do not need a commit."""
-    db = db_connect()
-    cur = db.cursor()
-    cur.execute(sql, params)
-    return cur.fetchall()
+    """Run a SELECT. Reads do not need a commit and are always replay-safe."""
+    def _do(stage):
+        cur = db_connect().cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+    return _run_with_retry(f"query {sql.strip()[:60]!r}", _do)
 
 
-def db_executemany(sql, rows):
+def db_executemany(sql, rows, idempotent=True):
     """Execute a batch of writes and commit once."""
     rows = list(rows)
     if not rows:
         return None
 
-    db = db_connect()
-    cur = db.cursor()
-    cur.executemany(sql, rows)
-
-    try:
+    def _do(stage):
+        db = db_connect()
+        cur = db.cursor()
+        cur.executemany(sql, rows)
+        stage["commit_sent"] = True
         db.commit()
-    except Exception as exc:
-        log.error("DB batch commit failed for statement %r: %s", sql[:120], exc)
-        raise
+        return cur
 
-    return cur
+    return _run_with_retry(f"batch write {sql.strip()[:60]!r}", _do, idempotent)
+
+
+def db_transaction(statements, idempotent=True):
+    """Run [(sql, params), ...] in ONE explicit transaction with one COMMIT.
+    Replaces the old hand-rolled BEGIN / execute / commit / rollback blocks,
+    which had no retry and no reconnect."""
+    statements = [st for st in statements if st]
+    if not statements:
+        return None
+
+    def _do(stage):
+        db = db_connect()
+        db.execute("BEGIN")
+        cur = db.cursor()
+        for sql, params in statements:
+            cur.execute(sql, params)
+        stage["commit_sent"] = True
+        db.commit()
+
+    return _run_with_retry(f"transaction ({len(statements)} stmts)", _do, idempotent)
 
 
 def db_commit():
     db_connect().commit()
 
 
-def db_rollback():
-    try:
-        db_connect().rollback()
-    except Exception:
-        pass
+PREDICTION_UNIQUE_INDEX = "uq_v401_predictions_source"
+PREDICTION_DEDUPE_BACKUP = "predictions_v401_dedupe_backup"
+HISTORY_UNIQUE_INDEX = "uq_v401_score_history"
+
+
+def _ensure_prediction_uniqueness():
+    """Real (symbol, strategy, source_close_ms) uniqueness on predictions_v401.
+
+    Until now this was only a NON-unique index plus an application-level
+    prediction_exists() check, which cannot stop a replayed batch or two
+    overlapping runs from inserting the same observation twice (duplicate
+    training rows). Existing databases may already contain duplicates,
+    which would make CREATE UNIQUE INDEX fail, so collapse them first,
+    keeping the most 'advanced' row of each group."""
+    if not db_query(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+        (PREDICTION_UNIQUE_INDEX,)
+    ):
+        dup_groups = db_query("""
+            SELECT COUNT(*) FROM (
+                SELECT 1 FROM predictions_v401
+                GROUP BY symbol, strategy, source_close_ms
+                HAVING COUNT(*) > 1
+            )
+        """)
+        n = int(dup_groups[0][0]) if dup_groups else 0
+        if n:
+            log.warning(
+                "predictions_v401: %d duplicated (symbol, strategy, source_close_ms) "
+                "groups; keeping the resolved/trained/signaled row of each", n
+            )
+            # Nothing is lost: the losing rows are copied whole into a
+            # backup table in the SAME transaction that deletes them.
+            db_execute(f"""CREATE TABLE IF NOT EXISTS {PREDICTION_DEDUPE_BACKUP}
+                AS SELECT * FROM predictions_v401 WHERE 0""")
+            losers = """
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY symbol, strategy, source_close_ms
+                        ORDER BY resolved DESC, trained DESC, signaled DESC, id ASC
+                    ) AS rn
+                    FROM predictions_v401
+                ) WHERE rn > 1
+            """
+            db_transaction([
+                (f"INSERT INTO {PREDICTION_DEDUPE_BACKUP} "
+                 f"SELECT * FROM predictions_v401 WHERE id IN ({losers})", ()),
+                (f"DELETE FROM predictions_v401 WHERE id IN ({losers})", ()),
+            ])
+            log.warning(
+                "predictions_v401: removed duplicate rows are archived in %s",
+                PREDICTION_DEDUPE_BACKUP
+            )
+
+    db_execute(f"""CREATE UNIQUE INDEX IF NOT EXISTS {PREDICTION_UNIQUE_INDEX}
+    ON predictions_v401(symbol, strategy, source_close_ms)""")
+    # The unique index covers the same columns; the old plain one is redundant.
+    db_execute("DROP INDEX IF EXISTS idx_v401_predictions_source")
+
+
+def _ensure_history_uniqueness():
+    """candidate_score_history_v401 was the only other append-only write, and
+    it had no natural key, so a replayed batch would duplicate rows. One row
+    is written per (symbol, run timestamp), so that pair is the key. This is
+    a low-value log, so existing duplicates are simply collapsed (lowest id
+    kept) rather than archived."""
+    if not db_query(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+        (HISTORY_UNIQUE_INDEX,)
+    ):
+        db_execute("""
+            DELETE FROM candidate_score_history_v401 WHERE id NOT IN (
+                SELECT MIN(id) FROM candidate_score_history_v401
+                GROUP BY symbol, logged_ms
+            )
+        """)
+    db_execute(f"""CREATE UNIQUE INDEX IF NOT EXISTS {HISTORY_UNIQUE_INDEX}
+    ON candidate_score_history_v401(symbol, logged_ms)""")
 
 
 def init_db():
@@ -407,8 +591,8 @@ def init_db():
 
     db_execute("""CREATE INDEX IF NOT EXISTS idx_v401_predictions_resolution
     ON predictions_v401(resolved, strategy)""")
-    db_execute("""CREATE INDEX IF NOT EXISTS idx_v401_predictions_source
-    ON predictions_v401(symbol, strategy, source_close_ms)""")
+    _ensure_prediction_uniqueness()
+    _ensure_history_uniqueness()
     db_execute("""CREATE INDEX IF NOT EXISTS idx_v401_snapshots
     ON market_snapshots_v401(symbol, snapshot_ms)""")
 
@@ -618,9 +802,9 @@ def _micro_history_available(symbol, as_of_ms):
     return micro is not None
 
 
-def _batch_upsert_candidate_states(rows):
+def _candidate_upsert_statement(rows):
     if not rows:
-        return
+        return None
     sql = """
     INSERT INTO candidate_state_v401
         (symbol, state, score, consecutive_qualify, consecutive_disqualify,
@@ -634,18 +818,19 @@ def _batch_upsert_candidate_states(rows):
         last_scored_ms=excluded.last_scored_ms
     """
     params = tuple(v for row in rows for v in row)
-    db_execute_no_commit(sql, params)
+    return sql, params
 
 
-def _batch_insert_candidate_history(rows):
+def _candidate_history_statement(rows):
     if not rows:
-        return
+        return None
     sql = """
     INSERT INTO candidate_score_history_v401
         (symbol, score, state_before, state_after, logged_ms)
-    VALUES """ + ",".join("(?,?,?,?,?)" for _ in rows)
+    VALUES """ + ",".join("(?,?,?,?,?)" for _ in rows) + """
+    ON CONFLICT(symbol, logged_ms) DO NOTHING"""
     params = tuple(v for row in rows for v in row)
-    db_execute_no_commit(sql, params)
+    return sql, params
 
 
 def advance_candidate(symbol, score, now_ms):
@@ -686,6 +871,7 @@ def advance_candidate(symbol, score, now_ms):
     db_execute("""
         INSERT INTO candidate_score_history_v401 (symbol, score, state_before, state_after, logged_ms)
         VALUES (?,?,?,?,?)
+        ON CONFLICT(symbol, logged_ms) DO NOTHING
     """, (symbol, score, state, new_state, now_ms))
     return new_state
 
@@ -813,15 +999,14 @@ def discover_and_score():
     # Exactly one transaction for the candidate hot path: one batched state
     # upsert + one batched history insert + one commit.
     if pending_states or pending_history:
-        db = db_connect()
-        try:
-            db.execute("BEGIN")
-            _batch_upsert_candidate_states(pending_states)
-            _batch_insert_candidate_history(pending_history)
-            db.commit()
-        except Exception:
-            db_rollback()
-            raise
+        # Both statements are replay-safe: the state rows are upserts to
+        # fixed values and the history insert is DO NOTHING on its unique
+        # key, so the whole transaction may be replayed after an
+        # ambiguous COMMIT.
+        db_transaction([
+            _candidate_upsert_statement(pending_states),
+            _candidate_history_statement(pending_history),
+        ])
 
     snapshot_targets = [
         row[0] for row in db_query(
@@ -2556,7 +2741,11 @@ def train_strategy(strategy):
         len(rows)
     )
 
-    db_execute("""
+    # ONE transaction: previously the model_state reset and the trained=1
+    # flip were two separate commits, so a failure in between left the
+    # counter reset while the examples still counted as untrained, which
+    # made maybe_train() immediately retry every run.
+    db_transaction([("""
     INSERT INTO model_state_v401 (
         strategy,
         model_version,
@@ -2594,15 +2783,13 @@ def train_strategy(strategy):
         test_metrics["brier"],
         precision,
         test_ev
-    ))
-
-    db_execute("""
+    )), ("""
     UPDATE predictions_v401
     SET trained=1
     WHERE strategy=?
       AND resolved=1
       AND train_candidate=1
-    """, (strategy,))
+    """, (strategy,))])
 
     log.info(
         "%s model trained | samples=%d | threshold=%.3f | temp=%.3f | "
@@ -2835,6 +3022,50 @@ def prediction_exists(symbol, strategy, source_close_ms):
         return False, False
 
     return bool(rows[0][0]), bool(rows[0][1])
+
+
+def insert_predictions(rows):
+    """The one write in this system that is NOT naturally idempotent: a
+    plain INSERT replayed after an ambiguous COMMIT (or by an overlapping
+    run) would create duplicate observations and poison the training set.
+
+    Special-cased so it is safe to replay: the unique index on
+    (symbol, strategy, source_close_ms) plus ON CONFLICT DO NOTHING turns a
+    replay into a no-op. Deliberately NOT `INSERT OR IGNORE`, which would
+    also silently swallow NOT NULL violations and drop real bad rows;
+    ON CONFLICT(...) DO NOTHING only ignores this exact duplicate."""
+    db_executemany(
+        """
+        INSERT INTO predictions_v401 (
+            symbol,
+            strategy,
+            predicted_at,
+            source_close_ms,
+            decision_entry_price,
+            target_price,
+            stop_price,
+            live_entry_price,
+            live_target_price,
+            live_stop_price,
+            atr,
+            predicted_prob,
+            calibrated_prob,
+            predicted_hours,
+            threshold,
+            signaled,
+            resolved,
+            train_candidate,
+            model_version,
+            sequence_json,
+            static_json,
+            created_at
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(symbol, strategy, source_close_ms) DO NOTHING
+        """,
+        rows,
+        idempotent=True
+    )
 
 
 def predict_signal(
@@ -3295,6 +3526,9 @@ def last_attempt_count(strategy):
 
 
 def mark_attempt(strategy, count):
+    """Record that a retrain was attempted with `count` untrained examples.
+    A pure upsert to a fixed value, so it is replay-safe; a failure now
+    rolls back inside the DB layer instead of leaving a dirty connection."""
     db_execute("""
     INSERT INTO model_state_v401 (strategy, new_resolved_since_train)
     VALUES (?, ?)
@@ -3305,32 +3539,64 @@ def mark_attempt(strategy, count):
 
 def maybe_train():
     trained_any = False
+    failures = []
 
+    # Each strategy is isolated: one failing (DB error, training crash)
+    # must not stop the other from being considered. Failures are collected
+    # and raised together at the end so main() still reports them.
     for strategy in STRATEGIES:
-        count = new_training_examples(
-            strategy
-        )
+        try:
+            count = new_training_examples(strategy)
+            attempted_at = last_attempt_count(strategy)
 
-        attempted_at = last_attempt_count(strategy)
+            # cleanup_old_data() prunes and abandons rows, so the untrained
+            # pool can shrink BELOW the recorded marker. Left alone,
+            # count - attempted_at stays negative and retraining is blocked
+            # until the pool grows back past the old marker. Re-baseline.
+            if attempted_at > count:
+                log.info(
+                    "%s: retrain marker %d is above untrained count %d; re-baselining",
+                    strategy, attempted_at, count
+                )
+                mark_attempt(strategy, count)
+                attempted_at = count
 
-        # Only attempt once another full RETRAIN_EVERY worth of new
-        # examples has accumulated since the LAST ATTEMPT (successful or
-        # not) — not just since the last success. Without this, a
-        # persistent failure condition (e.g. class imbalance that isn't
-        # resolving) causes a full training pipeline to be re-attempted
-        # every single hourly run indefinitely, burning CI time on a
-        # doomed-to-fail retry each time.
-        if count - attempted_at >= RETRAIN_EVERY:
+            # Only attempt once another full RETRAIN_EVERY worth of new
+            # examples has accumulated since the LAST ATTEMPT (successful or
+            # not) - not just since the last success. Without this, a
+            # persistent failure condition (e.g. class imbalance that isn't
+            # resolving) re-runs the full training pipeline every hourly run.
+            if count - attempted_at < RETRAIN_EVERY:
+                continue
+
             log.info(
                 "%s: attempting retrain (%d new examples since last attempt)",
                 strategy,
                 count - attempted_at
             )
 
+            # Marker is written BEFORE training on purpose: a crash or
+            # exception mid-training still counts as an attempt.
             mark_attempt(strategy, count)
 
             if train_strategy(strategy):
                 trained_any = True
+
+        except Exception as exc:
+            log.exception("Training failed for %s: %s", strategy, exc)
+            failures.append((strategy, exc))
+
+            # Re-assert the marker from a FRESH count so a failure cannot
+            # leave it lower than the pool (an instant retry storm next
+            # run). Best effort; the re-baseline above heals any overshoot.
+            try:
+                mark_attempt(strategy, new_training_examples(strategy))
+            except Exception as mark_exc:
+                log.warning("%s: could not re-assert retrain marker: %s", strategy, mark_exc)
+
+    if failures:
+        detail = "; ".join(f"{name}: {type(e).__name__}: {str(e)[:120]}" for name, e in failures)
+        raise RuntimeError(f"training failed for {len(failures)} strategy(ies): {detail}") from failures[0][1]
 
     return trained_any
 
@@ -3433,21 +3699,15 @@ def main():
             snapshot_failed.append(symbol)
 
     if pending_snapshots:
-        db = db_connect()
-        try:
-            db.execute("BEGIN")
-            sql = """
-                INSERT OR IGNORE INTO market_snapshots_v401 (
-                    symbol, snapshot_ms, price, obi5, obi10, obi20, obi50, obi100,
-                    spread_bps, book_age_sec, funding, open_interest, oi_change,
-                    btc_ret24, btc_vol24, btc_ema_spread
-                ) VALUES """ + ",".join("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" for _ in pending_snapshots)
-            params = tuple(v for row in pending_snapshots for v in row)
-            db_execute_no_commit(sql, params)
-            db.commit()
-        except Exception:
-            db_rollback()
-            raise
+        sql = """
+            INSERT OR IGNORE INTO market_snapshots_v401 (
+                symbol, snapshot_ms, price, obi5, obi10, obi20, obi50, obi100,
+                spread_bps, book_age_sec, funding, open_interest, oi_change,
+                btc_ret24, btc_vol24, btc_ema_spread
+            ) VALUES """ + ",".join("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" for _ in pending_snapshots)
+        params = tuple(v for row in pending_snapshots for v in row)
+        # INSERT OR IGNORE on UNIQUE(symbol, snapshot_ms): replay-safe.
+        db_transaction([(sql, params)])
 
     log.info("TIMING snapshot DB writes: %.2fs", time.perf_counter() - snapshot_t0)
 
@@ -3540,37 +3800,7 @@ def main():
 
     # Preserve all prediction/observation rows exactly; only the DB write
     # boundary changes to one batch INSERT and one COMMIT for this pass.
-    if prediction_batch:
-        db_executemany(
-            """
-            INSERT INTO predictions_v401 (
-                symbol,
-                strategy,
-                predicted_at,
-                source_close_ms,
-                decision_entry_price,
-                target_price,
-                stop_price,
-                live_entry_price,
-                live_target_price,
-                live_stop_price,
-                atr,
-                predicted_prob,
-                calibrated_prob,
-                predicted_hours,
-                threshold,
-                signaled,
-                resolved,
-                train_candidate,
-                model_version,
-                sequence_json,
-                static_json,
-                created_at
-            )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            prediction_batch
-        )
+    insert_predictions(prediction_batch)
 
     # Send signal notifications only after the prediction batch has been
     # durably written, preserving the old ordering (DB write before alert).
