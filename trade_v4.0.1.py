@@ -277,6 +277,9 @@ _TRANSIENT_DB_MARKERS = (
     "temporarily", "unavailable", "bad gateway", "gateway", "502", "503",
     "504", "429", "too many requests", "stream", "baton", "eof",
     "network", "ssl", "closed", "database is locked", "busy",
+    # added:
+    "incompleteread", "incomplete read", "remote end closed",
+    "chunked", "request to", "protocol error",
 )
 
 
