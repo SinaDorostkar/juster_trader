@@ -3569,6 +3569,8 @@ def maybe_train():
             # not) - not just since the last success. Without this, a
             # persistent failure condition (e.g. class imbalance that isn't
             # resolving) re-runs the full training pipeline every hourly run.
+            log.info("%s: train gate | untrained=%d marker=%d need=%d",
+         strategy, count, attempted_at, RETRAIN_EVERY)
             if count - attempted_at < RETRAIN_EVERY:
                 continue
 
